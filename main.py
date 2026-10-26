@@ -24,11 +24,14 @@ from typing import Optional
 import socketio as _sio
 import numpy as np
 import fd_slave_api
+import flask.cli
+flask.cli.show_server_banner = lambda *a, **k: None
 import ctypes
 import size_sync
 import csv
 import fd_auth
 from logic_editor import load_logic_xml, validate as validate_logic, LogicEditorPanel
+from datetime import datetime, timedelta, timedelta
 
 try:
 
@@ -50,21 +53,37 @@ from logic_cycle_engine import LogicCycleEngine
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def setup_logging(level_str: str):
+LOG_FILE = Path(__file__).parent / "logs" / "ct_monitor.log"
+_file_handler = None
+
+
+def set_file_logging(enabled: bool):
+    """Pasang/lepas handler file saat runtime. Handler konsol tidak disentuh."""
+    global _file_handler
+    root = logging.getLogger()
+    if enabled and _file_handler is None:
+        LOG_FILE.parent.mkdir(exist_ok=True)
+        h = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        root.addHandler(h)
+        _file_handler = h
+    elif not enabled and _file_handler is not None:
+        root.removeHandler(_file_handler)
+        _file_handler.close()
+        _file_handler = None
+def set_debug_logging(on: bool):
+    """ON: konsol + file. OFF: semua log mati (konsol dan file), termasuk modul lain."""
+    set_file_logging(on)
+    logging.disable(logging.NOTSET if on else logging.CRITICAL)
+
+def setup_logging(level_str: str, debug_files: bool = True):
     level = getattr(logging, level_str.upper(), logging.INFO)
-    Path(__file__).parent.joinpath("logs").mkdir(exist_ok=True)
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(
-                Path(__file__).parent / "logs" / "ct_monitor.log",
-                encoding="utf-8",
-            ),
-        ],
+        handlers=[logging.StreamHandler()],      # konsol: selalu aktif
     )
-
+    set_debug_logging(debug_files)
 
 logger = logging.getLogger(__name__)
 LOGIC_CONFIG_PATH = Path(__file__).parent / "config" / "logic_config.xml"
@@ -406,36 +425,45 @@ class TaktTimeSource:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FrameLogger
 # ═══════════════════════════════════════════════════════════════════════════════
-
-
 class FrameLogger:
-    def __init__(self, log_path: str):
+    def __init__(self, log_path: str, enabled: bool = True):
+        self._path = log_path
         self._lock = threading.Lock()
-        self._file = open(log_path, "w", encoding="utf-8", buffering=1)
+        self._file = None
         self._start = time.time()
-        self._file.write(
-            f"# CT Monitor Log\n"
-            f"# Mulai: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"{'=' * 70}\n"
-        )
+        self.set_enabled(enabled)
+
+    @property
+    def enabled(self) -> bool:
+        return self._file is not None
+
+    def set_enabled(self, enabled: bool):
+        with self._lock:
+            if enabled and self._file is None:
+                self._file = open(self._path, "a", encoding="utf-8", buffering=1)
+                self._file.write(
+                    f"# CT Monitor Log\n"
+                    f"# Mulai: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"{'=' * 70}\n"
+                )
+            elif not enabled and self._file is not None:
+                self._file.write(
+                    f"{'=' * 70}\n"
+                    f"# Selesai: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+                self._file.close()
+                self._file = None
 
     def log(self, tag: str, msg: str, console: bool = True):
         ms = (time.time() - self._start) * 1000
-        line = f"{ms:10.1f}ms | {tag:<8} | {msg}"
         with self._lock:
-            self._file.write(line + "\n")
+            if self._file:
+                self._file.write(f"{ms:10.1f}ms | {tag:<8} | {msg}\n")
         if console:
             logger.info(f"[{tag}] {msg}")
 
     def close(self):
-        with self._lock:
-            self._file.write(
-                f"{'=' * 70}\n"
-                f"# Selesai: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            )
-            self._file.close()
-
-
+        self.set_enabled(False)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CycleReporter (CSV lokal)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -670,11 +698,59 @@ class ROIViewer:
             cv2.putText(frame, label, (p1[0] + 3, ty), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, color, 1, cv2.LINE_AA)
         return frame
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Shift (waktu lokal)
+#  Shift 1: 19:00 - 07:00   |   Shift 2: 07:00 - 19:00
+# ═══════════════════════════════════════════════════════════════════════════════
+_VIDEO_TS_RE = re.compile(r"_(\d{8})_(\d{6})")
+
+
+def shift_info(now: datetime):
+    """Return (nama, awal, akhir) shift yang sedang berjalan pada waktu `now`."""
+    h = now.hour
+    if h >= 19 or h < 7:
+        name = "Shift 1"
+        start = now.replace(hour=19, minute=0, second=0, microsecond=0)
+        if h < 7:                       # lewat tengah malam: shift mulai kemarin 19:00
+            start -= timedelta(days=1)
+    else:
+        name = "Shift 2"
+        start = now.replace(hour=7, minute=0, second=0, microsecond=0)
+    return name, start, start + timedelta(hours=12)
+
+def _video_time(p: Path):
+    """Waktu video dari nama file (YYYYMMDD_HHMMSS); fallback ke mtime."""
+    m = _VIDEO_TS_RE.search(p.name)
+    if m:
+        try:
+            return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+    try:
+        return datetime.fromtimestamp(p.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def count_shift_videos(start: datetime, end: datetime):
+    """Hitung video normal / anomali yang direkam dalam [start, end)."""
+    ok = anom = 0
+    for sub, is_ok in (("normal", True), ("anomali", False)):
+        for f in VIDEOS_DIR.glob(f"*/*/{sub}/*.mp4"):
+            if f.name.startswith("_tmp_"):
+                continue
+            t = _video_time(f)
+            if t and start <= t < end:
+                if is_ok:
+                    ok += 1
+                else:
+                    anom += 1
+    return ok, anom
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CTMonitorApp
 # ═══════════════════════════════════════════════════════════════════════════════
-
-
 class CTMonitorApp:
     OUTPUT_FPS = 24
 
@@ -693,8 +769,12 @@ class CTMonitorApp:
             self._logic_config = None
             logger.error("[Logic] Gagal membaca %s: %s", self._logic_path, e)
         self.root.title(f"CT Monitor — Station {args.station}")
-        self.root.geometry("1280x760")
-        self.root.minsize(1050, 650)
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self._compact = sw <= 1280 or sh <= 800          # mode layar kecil
+        w = min(1280, sw)
+        h = min(760, sh - 48)                            # sisakan ruang taskbar
+        self.root.geometry(f"{w}x{h}+0+0")
+        self.root.minsize(1, 1)
 
         # ── Kamera state ───────────────────────────────────────────────────
         self.cap = None
@@ -752,8 +832,10 @@ class CTMonitorApp:
         # ── Output dir ─────────────────────────────────────────────────────
         self.output_dir = os.path.join(os.getcwd(), "captures")
         os.makedirs(self.output_dir, exist_ok=True)
+        self._debug_var = tk.BooleanVar(value=not getattr(args, "nondebug", False))
         log_name = f"framelog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        self._logger = FrameLogger(os.path.join(self.output_dir, log_name))
+        self._logger = FrameLogger(os.path.join(self.output_dir, log_name),
+                                enabled=self._debug_var.get())
         self._reporter: Optional[CycleReporter] = None
 
         # ── Tk vars ────────────────────────────────────────────────────────
@@ -776,6 +858,10 @@ class CTMonitorApp:
         self._var_disc_lim = tk.StringVar(value="—")
         self._var_min_lim  = tk.StringVar(value="—")
         self._var_ok_count = tk.StringVar(value="0")
+        self._var_shift = tk.StringVar(value="—")
+        self._shift_key = None          # awal shift aktif; berubah = ganti shift
+        self._shift_ok = 0
+        self._shift_anom = 0
         self._var_anom_count = tk.StringVar(value="0")
         self._var_server   = tk.StringVar(value="Menghubungkan...")
         _u = urlparse(args.endpoint)
@@ -814,6 +900,7 @@ class CTMonitorApp:
         self._var_short_lim = tk.StringVar(value="—")
         self._roi_editor = None
         self._mode = "setting"      # "setting" | "production"
+        
         self._build_ui()
         self._bind_shortcuts()
         self._restore_setup()
@@ -830,7 +917,7 @@ class CTMonitorApp:
             self._logger.close()
             sys.exit(0)
         self.authenticated = True
-
+        self._shift_tick()
         # Server baru dihubungi setelah login berhasil
         threading.Thread(target=self._init_server, daemon=True).start()
 
@@ -1235,6 +1322,7 @@ class CTMonitorApp:
             "conf": round(float(self.conf_var.get()), 2),
             "disabled_classes": disabled,
             "output_dir": self.output_dir,
+            "debug": bool(self._debug_var.get()),
         }
         try:
             SETUP_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1303,7 +1391,9 @@ class CTMonitorApp:
         dc = d.get("disabled_classes")
         if isinstance(dc, list):
             self._saved_disabled_classes = {str(x) for x in dc}
-
+        if isinstance(d.get("debug"), bool) and not getattr(self.args, "nondebug", False):
+            self._debug_var.set(d["debug"])
+            self._toggle_debug()
         # Folder output
         od = d.get("output_dir")
         if od and os.path.isdir(od) and os.access(od, os.W_OK):
@@ -1707,7 +1797,9 @@ class CTMonitorApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        main = ttk.Frame(self.root, padding=10)
+        pad = 4 if self._compact else 10
+        ctrl_w = 270 if self._compact else 300
+        main = ttk.Frame(self.root, padding=pad)
         main.grid(row=0, column=0, sticky="nsew")
         main.columnconfigure(0, weight=1)
         main.rowconfigure(0, weight=1)
@@ -1716,12 +1808,14 @@ class CTMonitorApp:
         preview_outer = ttk.LabelFrame(
             main, text="Live Preview", padding=5
         )
-        preview_outer.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        preview_outer.grid(row=0, column=0, sticky="nsew", padx=(0, pad))
         preview_outer.rowconfigure(0, weight=1)
         preview_outer.columnconfigure(0, weight=1)
 
-        self._preview_container = tk.Frame(preview_outer, bg="black")
+        self._preview_container = tk.Frame(preview_outer, bg="black", width=1, height=1)
         self._preview_container.grid(row=0, column=0, sticky="nsew")
+        self._preview_container.pack_propagate(False)    # label/gambar tidak boleh memaksa container membesar
+        self._preview_container.grid_propagate(False)
 
         self.preview = tk.Label(
             self._preview_container,
@@ -1736,9 +1830,13 @@ class CTMonitorApp:
         # Control panel (scrollable)
         ctrl_outer = tk.Frame(main)
         ctrl_outer.grid(row=0, column=1, sticky="nsew")
-        main.columnconfigure(1, minsize=300, weight=0)
+        main.columnconfigure(1, minsize=0, weight=0)
+        ctrl_canvas = tk.Canvas(ctrl_outer, highlightthickness=0, width=1)
 
-        ctrl_canvas = tk.Canvas(ctrl_outer, highlightthickness=0)
+        def _fit_ctrl(e):
+            # lebar panel kontrol = 30% window, maksimal ctrl_w, boleh sampai 0
+            ctrl_canvas.config(width=max(0, min(ctrl_w, int(e.width * 0.3))))
+        main.bind("<Configure>", _fit_ctrl)
         ctrl_scrollbar = ttk.Scrollbar(
             ctrl_outer, orient="vertical", command=ctrl_canvas.yview
         )
@@ -1815,9 +1913,10 @@ class CTMonitorApp:
         _row("Station ID", self._var_station)
         _row("Nama",       self._var_name)
         _row("Line",       self._var_line)
-        _row("Hostname",   self._var_host)
-        _row("IP",         self._var_ip)
-        _row("Port",       self._var_port)
+        if not self._compact:
+            _row("Hostname", self._var_host)
+            _row("IP",       self._var_ip)
+            _row("Port",     self._var_port)
 
         op_row = ttk.Frame(box)
         op_row.pack(fill="x", pady=(6, 0))
@@ -1857,7 +1956,7 @@ class CTMonitorApp:
         _row("Short (s)", self._var_short_lim) 
         _row("Cycle Count", self._var_cycle, bold=True)
         _row("Takt Time", self._var_takt)
-
+        _row("Shift", self._var_shift)
         count_row = ttk.Frame(box)
         count_row.pack(fill="x", pady=(6, 2))
         ttk.Label(count_row, text="OK", width=4, anchor="w").pack(side="left")
@@ -1874,6 +1973,7 @@ class CTMonitorApp:
             font=("Consolas", 11, "bold"),
             foreground="#c62828",
         ).pack(side="left")
+        
     def _build_panel_cycle_time(self, parent):
         box = ttk.LabelFrame(parent, text="Cycle Time", padding=8)
         box.pack(fill="x", pady=(0, 6))
@@ -1893,7 +1993,7 @@ class CTMonitorApp:
         ttk.Label(box, text="Last Cycle", anchor="w").pack(fill="x")
         self._last_ct_label = ttk.Label(
             box, textvariable=self._var_last_ct,
-            font=("Consolas", 32, "bold"), anchor="center",
+            font=("Consolas", 22 if self._compact else 32, "bold"), anchor="center",
         )
         self._last_ct_label.pack(fill="x", pady=(0, 4))
 
@@ -2112,8 +2212,13 @@ class CTMonitorApp:
             anchor="w", pady=(0, 4)
         )
         ttk.Label(box, text="Recording:").pack(anchor="w")
-        ttk.Label(
-            box, textvariable=self.record_status_var, font=("Arial", 10, "bold")
+        ttk.Label(box, textvariable=self.record_status_var, font=("Arial", 10, "bold")).pack(
+            anchor="w"
+        )
+        ttk.Separator(box, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Checkbutton(
+            box, text="🐞  Debug Mode",
+            variable=self._debug_var, command=self._toggle_debug,
         ).pack(anchor="w")
 
     # ──────────────────────────────────────────────────────────────────────
@@ -2145,6 +2250,19 @@ class CTMonitorApp:
             self._var_operator.set(value)
             self.args.operator = value
             self.root_status.config(text=f"Operator: {value}")
+    def _toggle_debug(self):
+        on = bool(self._debug_var.get())
+        if on:
+            set_debug_logging(True)
+            self._logger.set_enabled(True)
+            logger.info("[Debug] Debug Mode AKTIF (terminal + file)")
+        else:
+            logger.info("[Debug] Debug Mode MATI (semua log dimatikan)")   # pesan terakhir
+            self._logger.set_enabled(False)
+            set_debug_logging(False)
+        self.root_status.config(
+            text="Debug Mode ON — log di terminal dan file" if on
+            else "Debug Mode OFF — semua log dimatikan")
     def _set_timer(self, key: str, entry):        # ← tempel di sini
         try:
             v = float(entry.get().replace(",", "."))
@@ -2185,6 +2303,37 @@ class CTMonitorApp:
         else:
             self._state_label.config(foreground="")
 
+    def _shift_tick(self):
+        """Cek tiap 1 detik. Saat ganti shift: reset label dan hitung ulang dari disk."""
+        try:
+            name, start, end = shift_info(datetime.now())
+            if start != self._shift_key:
+                self._shift_key = start
+                self._shift_ok = self._shift_anom = 0
+                self._var_ok_count.set("0")
+                self._var_anom_count.set("0")
+                self._var_shift.set(f"{name} ({start:%H}-{end:%H})")
+                self._resync_shift_counts(start, end)
+                logger.info(f"[Shift] {name} {start:%Y-%m-%d %H:%M} - {end:%H:%M}")
+        except Exception as e:
+            logger.error(f"[Shift] tick error: {e}", exc_info=True)
+        self.root.after(1000, self._shift_tick)
+
+    def _resync_shift_counts(self, start, end):
+        """Hitung ulang dari folder video di thread terpisah (tidak menahan UI)."""
+        def work():
+            ok, anom = count_shift_videos(start, end)
+
+            def apply():
+                if self._shift_key != start:      # shift sudah berganti lagi
+                    return
+                self._shift_ok, self._shift_anom = ok, anom
+                self._var_ok_count.set(str(ok))
+                self._var_anom_count.set(str(anom))
+            self._ui(apply)
+
+        threading.Thread(target=work, daemon=True, name="shift-count").start()
+
     def _on_cycle_ui_update(self, cycle_count: int, cycle_time: float, anom_type: str,
                             is_genesis: bool = False, skipped=None, label: str = ""):
         skipped = skipped or []
@@ -2203,25 +2352,27 @@ class CTMonitorApp:
         self.root_status.config(
             text=f"Cycle {cycle_count} selesai | CT={cycle_time:.2f}s | {tag}"
         )
-        # Update OK/ANOM count dari folder
-        ok_n = sum(1 for f in VIDEOS_DIR.glob("*/*/normal/*.mp4")
-                   if not f.name.startswith("_tmp_"))
-        anom_n = sum(1 for _ in VIDEOS_DIR.glob("*/*/anomali/*.mp4"))
-        self._var_ok_count.set(str(ok_n))
-        self._var_anom_count.set(str(anom_n))
+        if anom_type != "OK" or skipped:
+            self._shift_anom += 1
+        else:
+            self._shift_ok += 1
+        self._var_ok_count.set(str(self._shift_ok))
+        self._var_anom_count.set(str(self._shift_anom))
 
     def _bind_shortcuts(self):
-        self.root.bind(
-            "<p>", lambda e: self.toggle_pause() if self.running else None
-        )
-        self.root.bind(
-            "<f>",
-            lambda e: self.take_photo() if self._latest_frame is not None else None,
-        )
-        self.root.bind(
-            "<r>", lambda e: self.toggle_recording() if self.running else None
-        )
-
+        def key(action, cond):
+            def h(e):
+                if isinstance(e.widget, (tk.Entry, ttk.Entry, tk.Text)):
+                    return
+                if cond():
+                    action()
+            return h
+        self.root.bind("<p>", key(self.toggle_pause, lambda: self.running))
+        self.root.bind("<f>", key(self.take_photo, lambda: self._latest_frame is not None))
+        self.root.bind("<r>", key(self.toggle_recording, lambda: self.running))
+        self.root.bind("<F11>", lambda e: self.root.attributes(
+            "-fullscreen", not self.root.attributes("-fullscreen")))
+        
     def _bind_mouse_scroll(self):
         def _scroll2(e):
             self._ctrl_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
@@ -2267,7 +2418,7 @@ class CTMonitorApp:
                 return
             self._sync_recorder()
             # Init reporter
-            if self._reporter is None:
+            if self._reporter is None and not getattr(self.args, "nondebug", False):
                 self._reporter = CycleReporter(self.output_dir)
                 self._logger.log("REPORT", f"CSV: {self._reporter.path()}")
         else:
@@ -2671,9 +2822,8 @@ class CTMonitorApp:
         scale = min(max_w / w, max_h / h)
         if scale >= 1:
             return image
-        return cv2.resize(
-            image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA
-        )
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        return cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA)
 
     # ──────────────────────────────────────────────────────────────────────
     #  Photo
@@ -2903,13 +3053,15 @@ if __name__ == "__main__":
     parser.add_argument("--takt-time", type=float, default=20.0)
     parser.add_argument("--no-record", action="store_true")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING"])
-
+    parser.add_argument("--nondebug", action="store_true",
+                        help="Mulai dengan Debug Mode mati (tanpa log file)")
+    
     args = parser.parse_args()
     args.station_no = 0
     args.station = 0
     args.line    = ""
 
-    setup_logging(args.log_level)
+    setup_logging(args.log_level, debug_files=not args.nondebug)
     args.endpoint, _src = resolve_endpoint(args.endpoint)
     logger.info(f"[Server] Target master: {args.endpoint} (sumber: {_src})")
 
