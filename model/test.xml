@@ -1,8 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<logic_config version="3" saved_at="2026-10-20 09:12:28" frame_width="640" frame_height="480" mirror="false" skip_mode="final" restart_on_input="false" single="false" max_det="0">
-  <main_roi role="input" id="in" x1="52" y1="78" x2="209" y2="252" classes="" conf="0.505" mode="center" min_overlap="0.400" priority="0" group="" dwell="0" grace="0" />
-  <main_roi role="output" id="out" x1="543" y1="184" x2="628" y2="290" classes="" conf="0.543" mode="center" min_overlap="0.400" priority="0" group="" dwell="0" grace="0" />
-  <sequence>
-    <roi order="1" tag="mandatory" description="transit jig to mask" id="s9" x1="306" y1="165" x2="387" y2="262" classes="left-operator-gloves,right-operator-gloves" conf="0.250" mode="center" min_overlap="0.400" priority="0" group="" dwell="0" grace="0" />
-  </sequence>
-</logic_config>
