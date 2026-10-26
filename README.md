@@ -31,7 +31,7 @@ A machine-vision system that measures **operator cycle time** on manufacturing p
 - Choose which detected classes are tracked, directly from the GUI
 - ROI-based cycle engine: a cycle is built from an `input` ROI, an ordered list of `sequence` ROIs, and an `output` ROI
 - Sequence ROIs are either **mandatory** or **expected**; each is shown on the live preview as completed (`OK`) or skipped (`SKIP`)
-- Cycle classification: **OK**, **LONG** (exceeds the anomaly limit) and **SHORT** (below the short-anomaly limit)
+- Cycle labelling: every cycle is tagged as **Normal** or **Anomaly** (sub-types **Long** and **Short**), and may additionally carry **Skipped**, **Genesis** or **Late** tags (see [Cycle labels](#cycle-labels))
 - Cycles shorter than a minimum time are not counted, and unfinished cycles are discarded after a timeout
 
 **Operation**
@@ -59,7 +59,7 @@ A machine-vision system that measures **operator cycle time** on manufacturing p
 2. **Detect** – frames are pushed into a small bounded queue (size 2; stale frames are dropped rather than queued) and processed by a background YOLO thread.
 3. **Evaluate** – detections (bounding boxes with labels) are passed to `LogicCycleEngine` on every inference, including frames with no detections, so dwell and grace timers can expire correctly.
 4. **Track the cycle** – the engine marks ROIs as done or skipped in order. When the output ROI is reached the cycle is complete; if the process is aborted or times out, the cycle is discarded.
-5. **Classify** – the measured cycle time is compared against the limits (see [Cycle timing parameters](#cycle-timing-parameters)) and labelled OK, LONG or SHORT.
+5. **Classify** – the measured cycle time is compared against the limits (see [Cycle timing parameters](#cycle-timing-parameters)) and labelled Normal, or Anomaly (Long / Short). Skipped sequence ROIs and other conditions add extra tags (see [Cycle labels](#cycle-labels)).
 6. **Record and report** – the cycle is appended to the CSV report, the video clip is saved, and the result is sent to the master server.
 
 ### ROI colours on the live preview
@@ -72,6 +72,22 @@ A machine-vision system that measures **operator cycle time** on manufacturing p
 | Sequence – expected | yellow | `<n>:E` |
 
 A completed ROI gets an `OK` suffix and a thicker border; a skipped one gets `SKIP`.
+
+### Cycle labels
+
+Labels are **not mutually exclusive**. A single cycle can be, for example, *Anomaly* + *Short* + *Skipped: mask*, as in the "Anomaly Videos" dashboard view.
+
+| Dashboard label | Meaning | CSV / internal value |
+|---|---|---|
+| **Normal** | Cycle time is within the configured limits | `anomaly = NO` (internal type `OK`) |
+| **Anomaly** | Parent category for any out-of-limit cycle | `anomaly = YES_LONG` or `YES_SHORT` |
+| ↳ **Long** | Cycle time is above the anomaly limit | `YES_LONG` (internal `LONG`) |
+| ↳ **Short** | Cycle time is below the short-anomaly limit. The dashboard shows the limit next to the cycle time (for example `11.65 s  < 14 s`) | `YES_SHORT` (internal `SHORT`) |
+| **Skipped** | One or more sequence ROIs were not completed. The reason is shown as `Skipped: <name>` (for example `Skipped: mask`) | stored in `anomaly_label` |
+| **Genesis** | `TODO`: define (the CSV has a `genesis` column) | `genesis = YES` |
+| **Late** | `TODO`: define | `TODO` |
+
+`TODO`: confirm the exact trigger of each label against `logic_cycle_engine.py` and the dashboard code. In particular, confirm whether a skipped mandatory ROI is what makes a cycle Short.
 
 ---
 
@@ -271,9 +287,9 @@ The station acts as a client of a master server (default port `3000`) and also r
 | `cycle_number` | Sequential cycle number in the session |
 | `start_time`, `end_time` | Timestamps with millisecond precision |
 | `cycle_time_seconds` | Measured cycle time |
-| `anomaly` | `NO`, `YES_LONG` or `YES_SHORT` |
-| `genesis` | `YES` / `NO` (`TODO`: explain what a genesis cycle is) |
-| `anomaly_label` | Optional free-text label |
+| `anomaly` | `NO` (Normal), `YES_LONG` or `YES_SHORT` |
+| `genesis` | `YES` / `NO`. Corresponds to the **Genesis** label (see [Cycle labels](#cycle-labels)) |
+| `anomaly_label` | Reason or tag text attached to the cycle, empty if none (for example `Skipped: mask`) |
 
 ---
 
