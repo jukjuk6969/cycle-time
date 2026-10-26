@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "rungs": [
+    {
+      "title": "",
+      "cond": [
+        {
+          "t": "p",
+          "b": [
+            [
+              {
+                "t": "c",
+                "n": "roi1",
+                "neg": false,
+                "prev": false,
+                "roi": true
+              }
+            ],
+            [
+              {
+                "t": "c",
+                "n": "m1",
+                "neg": false,
+                "prev": false,
+                "roi": false
+              }
+            ]
+          ]
+        },
+        {
+          "t": "c",
+          "n": "M0",
+          "neg": true,
+          "prev": false,
+          "roi": false
+        }
+      ],
+      "out": {
+        "kind": "coil",
+        "name": "m1",
+        "bt": "",
+        "p": 0.0
+      },
+      "extras": []
+    },
+    {
+      "title": "",
+      "cond": [
+        {
+          "t": "c",
+          "n": "M1",
+          "neg": false,
+          "prev": false,
+          "roi": false
+        }
+      ],
+      "out": {
+        "kind": "block",
+        "name": "ton_1",
+        "bt": "TON",
+        "p": 1.0
+      },
+      "extras": []
+    },
+    {
+      "title": "",
+      "cond": [
+        {
+          "t": "c",
+          "n": "ton_1",
+          "neg": false,
+          "prev": false,
+          "roi": false
+        }
+      ],
+      "out": {
+        "kind": "coil",
+        "name": "m2",
+        "bt": "",
+        "p": 0.0
+      },
+      "extras": []
+    }
+  ],
+  "memory": {
+    "aliases": {
+      "reset": {
+        "address": "M0",
+        "type": "BOOL"
+      }
+    }
+  }
+}

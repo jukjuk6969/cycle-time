@@ -1,0 +1,18 @@
+{
+  "version": 3,
+  "saved_at": "2026-10-26T09:52:36",
+  "model_path": "C:/Users/avi-w/Documents/cycle-time-project-main/model/model-26-v2/best.pt",
+  "saving": true,
+  "logic_path": "C:\\Users\\avi-w\\Documents\\cycle-time-project-main\\config\\logic_config.xml",
+  "source": "Video File",
+  "camera_name": "HD USB CAMERA",
+  "video_path": "C:/Users/avi-w/Documents/cycle-time-project-main/WhatsApp Video 2026-10-21 at 13.30.51.mp4",
+  "width": 640,
+  "height": 480,
+  "fps": 24,
+  "format": "mp4 (H.265)",
+  "mirror": false,
+  "conf": 0.62,
+  "disabled_classes": [],
+  "output_dir": "C:\\Users\\avi-w\\Documents\\cycle-time-project-main\\captures"
+}

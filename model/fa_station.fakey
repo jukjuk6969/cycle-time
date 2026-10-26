@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "v": 1,
+    "line": 6,
+    "station": 10,
+    "secret": "d2ec47f0cdb018f005f64442a48a0ccc3a703371521f033d8d1c490e87ae2acf"
+  },
+  "sig": "wPp0mLnMRN6+FwAJ1sl1XMBSGYQ8204sHNgq7YFtriXLlTy7gHLtoCoHTPbGojb9JsVyRO6VBFe1UtDYchmUDA=="
+}

@@ -1,0 +1,11 @@
+{
+  "station_id": 10,
+  "line": 6,
+  "name": "Innercase Assy",
+  "takt_time": 24,
+  "roi_timeout_sec": 120,
+  "min_cycle_sec": 7,
+  "ip": "192.168.137.154",
+  "port": 5001,
+  "hostname": "Winteq"
+}
