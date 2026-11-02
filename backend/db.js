@@ -1,9 +1,8 @@
-const sql = require("mssql");          // sementara: hanya agar export `sql` lama tetap ada; hapus setelah server.js dicek
 const pg = require("pg");
 const { Pool, types } = pg;
 const envResult = require("dotenv").config();
 
-const dbLog = (m) => console.log(`[${new Date().toISOString()}] [db] ${m}`);
+const dbLog = (m) => { if (process.env.LOG_VERBOSE === "true") console.log(`[${new Date().toISOString()}] [db] ${m}`); };
 
 // Kolom timestamp (tanpa zona) berisi UTC → baca & tulis sebagai UTC, bukan zona lokal Node
 pg.defaults.parseInputDatesAsUTC = true;
@@ -14,9 +13,9 @@ types.setTypeParser(1700, (s) => parseFloat(s));  // numeric → number
 const config = {
   host: process.env.DBSERVER || "localhost",
   database: process.env.DBNAME || "CTMonitor",
-  user: process.env.DBUSER || "123321123321123321123321123321123321123321",
-  password: process.env.DBPASSWORD || "123321123321123321123321123321123321123321123321123321",
-  port: parseInt(process.env.DBPORT) || 909090909090990990909090990990909090990909090909090909,
+  user: process.env.DBUSER || "postgres",
+  password: process.env.DBPASSWORD || "123",
+  port: parseInt(process.env.DBPORT) || 5432,
   max: parseInt(process.env.DB_POOLMAX) || 30,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,   // gagal cepat
@@ -712,5 +711,4 @@ module.exports = {
   markFdOffline,
   shiftRange, prodDayRange, resolveAnomalyType, videoParams,
   insertCyclesBatch,
-  sql,
 };
