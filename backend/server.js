@@ -322,7 +322,8 @@ setInterval(() => {
     `ext=${mb(m.external)}MB buf=${mb(m.arrayBuffers)}MB`);
   loopH.reset();
 }, 10_000).unref();
-function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
+const VERBOSE = process.env.LOG_VERBOSE === "true";   // default mati; nyalakan lewat .env bila perlu
+function log(msg) { if (VERBOSE) console.log(`[${new Date().toISOString()}] ${msg}`); }
 const q = async (text, params = []) => (await db.getPool()).query(text, params);
 // ── batas koneksi proxy video/stream: melindungi bandwidth & CPU server ──
 function limiter(name, max) {
@@ -909,7 +910,17 @@ app.post("/api/cycle", async (req, res) => {
     const anomaly_label = lbl && lbl !== "OK" ? lbl.slice(0, 300) : null;
     const is_anomaly = anomaly_type !== "OK" || skippedList.length > 0;
 
-    if (!st.reserve(endTs)) {
+    let reserved;
+    try {
+      reserved = st.reserve(endTs);
+    } catch (e) {
+      if (e.code === "FUTURE_TS") {
+        log(`CYCLE ditolak L${line} ST${station_id}: end_timestamp ${new Date(endTs * 1000).toISOString()} melebihi jam server`);
+        return res.status(400).json({ error: e.message, code: "FUTURE_TS", server_time: Date.now() / 1000 });
+      }
+      throw e;
+    }
+    if (!reserved) {
       if (data.video?.filename) {
         db.attachVideo({ line, station_id, end_timestamp: endTs, video: data.video, label: data.label })
           .then((n) => n && log(`VIDEO dipulihkan: ${data.video.filename}`))
@@ -936,9 +947,11 @@ app.post("/api/cycle", async (req, res) => {
       video: db.videoParams(data),
     };
 
+    st.pending++;                         // dari sini sampai apply, refresh() tidak boleh menimpa counter stasiun ini
     try {
       await engine.enqueue(row);          // durable: resolve setelah batch commit
     } catch (e) {
+      st.pending--;
       st.rollback(endTs);
       if (e.code === "BACKPRESSURE") return res.status(503).set("Retry-After", "2").json({ error: "overloaded" });
       throw e;
@@ -946,6 +959,7 @@ app.post("/api/cycle", async (req, res) => {
 
     // data terlambat dari shift lama tidak boleh masuk counter shift berjalan
     const live = st.isLive(endTs); if (live) st.apply(data.cycle_time_sec);
+    st.pending--;
     const cycle_count = live ? st.cyclesShift : null;
 
     log(`CYCLE L${line} ST${station_id} n=${cycle_count ?? "-"} ct=${data.cycle_time_sec}s [${anomaly_type}${skipped_expected ? "+EXPECTED:" + skipped_expected : ""}]`
@@ -967,8 +981,9 @@ app.post("/api/cycle", async (req, res) => {
     res.status(201).json({ ok: true, cycle_count });
     // summary_update TIDAK dipanggil di sini lagi; dikirim dari tick (tahap berikutnya)
   } catch (err) {
-    console.error("[cycle]", err.message);
-    res.status(500).json({ error: err.message });
+    const isDataErr = /^(22|23)/.test(String(err.code || ""));   // SQLSTATE: data tidak valid / pelanggaran constraint
+    console.error("[cycle]", err.code || "-", err.message);
+    res.status(isDataErr ? 422 : 500).json({ error: err.message, code: err.code || undefined });
   }
 });
 app.post("/api/heartbeat", (req, res) => {
