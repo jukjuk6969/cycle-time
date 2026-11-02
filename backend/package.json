@@ -11,8 +11,7 @@
     "cors": "^2.8.6",
     "dotenv": "^16.6.1",
     "express": "^4.22.3",
-    "msnodesqlv8": "^5.1.8",
-    "mssql": "^12.7.9",
+    "pg": "^8.23.1",
     "socket.io": "^4.8.4"
   },
   "devDependencies": {
