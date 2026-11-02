@@ -1,19 +1,21 @@
 const db = require("./db");
-
+const VERBOSE = process.env.LOG_VERBOSE === "true";
 const stations = new Map();                 // "line-station" -> Station
 let ready = false;
 let ioRef = null;
 let snapCache = null;                       // { all: [...], byLine: Map(line -> [...]) }, dibangun ulang hanya bila ada perubahan
 let lastLines = new Set();                  // line yang pernah dikirim, supaya line yang kosong tetap diberi tahu
-
+const removedLines = new Set();             // line yang kehilangan stasiun saat refresh; diumumkan di tick berikutnya
 const shiftStartOf = (sec) => db.shiftRange(new Date(sec * 1000)).start.getTime();
 const dayStartOf = (sec) => db.prodDayRange(new Date(sec * 1000)).start.getTime();
 const msKey = (sec) => new Date(sec * 1000).getTime();   // sama persis dengan yang disimpan SQL
+const FUTURE_TOLERANCE_SEC = 60;   // toleransi selisih jam perangkat; sesuaikan bila perlu
 
 class Station {
     constructor(line, id) {
         this.line = line; this.id = id; this.meta = null;
         this.seq = 0; this.dirty = false;
+        this.pending = 0;
         this.seen = new Set();
         this.shiftStart = 0; this.dayStart = 0;
         this.cyclesShift = 0; this.cyclesDay = 0; this.sumCtDay = 0; this.lastCt = null;
@@ -26,8 +28,13 @@ class Station {
     }
     isLive(sec) { return shiftStartOf(sec) === this.shiftStart; }
     reserve(sec) {
+        if (sec > Date.now() / 1000 + FUTURE_TOLERANCE_SEC) {
+            const e = new Error("timestamp melebihi waktu server");
+            e.code = "FUTURE_TS";
+            throw e;                                // jangan memajukan shift dari jam perangkat yang salah
+        }
         this.roll(sec);
-        if (!this.isLive(sec)) return true;     // data shift lama: dedup diserahkan ke SQL (NOT EXISTS)
+        if (!this.isLive(sec)) return true;         // data shift lama: dedup diserahkan ke SQL (NOT EXISTS)
         const k = msKey(sec);
         if (this.seen.has(k)) return false;
         this.seen.add(k);
@@ -80,13 +87,16 @@ function snapshotForLines(lines) {
     return lines.flatMap((l) => byLine.get(Number(l)) || []);
 }
 
-// kirim summary: room "all" menerima semua; tiap room "line:N" hanya stasiun line-nya
 function emitSummary(io, rows = snapshotAll(), onlyLines = null) {
-    const byLine = new Map();
-    for (const r of rows) {
-        const l = Number(r.line);
-        if (!byLine.has(l)) byLine.set(l, []);
-        byLine.get(l).push(r);
+    const snap = buildSnap();
+    let byLine = snap.byLine;
+    if (rows !== snap.all) {                    // rows bukan snapshot cache: kelompokkan sendiri
+        byLine = new Map();
+        for (const r of rows) {
+            const l = Number(r.line);
+            if (!byLine.has(l)) byLine.set(l, []);
+            byLine.get(l).push(r);
+        }
     }
     io.to("all").emit("summary_update", rows);
     const lines = new Set([...lastLines, ...byLine.keys()]);
@@ -94,19 +104,27 @@ function emitSummary(io, rows = snapshotAll(), onlyLines = null) {
         if (onlyLines && !onlyLines.has(l)) continue;
         io.to(`line:${l}`).emit("summary_update", byLine.get(l) || []);
     }
-    lastLines = new Set(byLine.keys());
+    lastLines = new Set(snap.byLine.keys());    // selalu dari snapshot penuh, bukan dari rows yang dikirim
 }
 
-// ── muat dari SQL: dipakai saat startup, rekonsiliasi, dan setelah konfigurasi berubah ──
 async function refresh(withSeen = false) {
+    const before = new Map();                  // kondisi sebelum query, untuk mendeteksi perubahan selama query
+    for (const [k, s] of stations) before.set(k, { seq: s.seq, pending: s.pending });
+
     const rows = await db.getStationSummary();
     const now = Date.now() / 1000;
     const alive = new Set();
 
     for (const r of rows) {
+        const key = `${r.line}-${r.station_id}`;
         const st = get(r.line, r.station_id);
-        alive.add(`${r.line}-${r.station_id}`);
+        alive.add(key);
         st.meta = r;
+
+        const b = before.get(key);
+        const racing = b && (b.pending > 0 || st.pending > 0 || st.seq !== b.seq);
+        if (racing) { st.mark(); continue; }   // hasil SQL mungkin belum/sudah memuat cycle ini: jangan timpa counter
+
         st.shiftStart = shiftStartOf(now); st.dayStart = dayStartOf(now);
         st.cyclesDay = r.cycles_today || 0;
         st.sumCtDay = (r.avg_ct_today || 0) * st.cyclesDay;
@@ -114,7 +132,9 @@ async function refresh(withSeen = false) {
         st.cyclesShift = r.cycle_count_total || 0;
         st.mark();
     }
-    for (const k of [...stations.keys()]) if (!alive.has(k)) stations.delete(k);
+    for (const [k, s] of [...stations]) {
+        if (!alive.has(k)) { removedLines.add(Number(s.line)); stations.delete(k); }
+    }
     snapCache = null;
 
     if (withSeen) {                            // hanya saat startup, supaya tidak menimpa reservasi yang sedang jalan
@@ -146,25 +166,33 @@ function enqueue(row) {
         if (!busy) setImmediate(flush);
     });
 }
+// error yang berasal dari isi baris (bukan dari koneksi/server): layak diisolasi per baris
+const isDataError = (e) => /^(22|23)/.test(String(e.code || ""));
 
+async function commitGroup(items) {
+    try {
+        await db.insertCyclesBatch(items.map((b) => b.row));
+        items.forEach((b) => b.resolve());
+    } catch (e) {
+        if (!isDataError(e) || items.length === 1) {   // infrastruktur, atau sudah tinggal satu baris
+            items.forEach((b) => b.reject(e));
+            return;
+        }
+        const mid = items.length >> 1;                 // bagi dua: baris buruk terisolasi dalam log2(n) langkah
+        await commitGroup(items.slice(0, mid));
+        await commitGroup(items.slice(mid));
+    }
+}
 async function flush() {
     if (busy || !queue.length) return;
     busy = true;
     const batch = queue.splice(0, BATCH);
     const t0 = Date.now();
     try {
-        await db.insertCyclesBatch(batch.map((b) => b.row));
-        batch.forEach((b) => b.resolve());
-    } catch (e) {
-        console.error("[engine] batch gagal:", e.message);
-        if (batch.length === 1) batch[0].reject(e);
-        else for (const b of batch) {            // satu baris bermasalah tidak boleh menjatuhkan yang lain
-            try { await db.insertCyclesBatch([b.row]); b.resolve(); }
-            catch (e2) { b.reject(e2); }
-        }
+        await commitGroup(batch);
     } finally {
         const ms = Date.now() - t0;
-        if (ms > 200) console.log(`[engine] flush ${batch.length} baris ${ms}ms`);
+        if (VERBOSE && ms > 200) console.log(`[engine] flush ${batch.length} baris ${ms}ms`);
         busy = false;
         if (queue.length) setImmediate(flush);
     }
@@ -177,6 +205,8 @@ function startTick(io) {
         const now = Date.now() / 1000;
         const sh = shiftStartOf(now), dy = dayStartOf(now);   // dihitung sekali, bukan per stasiun
         const dirtyLines = new Set();
+        for (const l of removedLines) dirtyLines.add(l);
+        removedLines.clear();
         for (const s of stations.values()) {
             s.rollTo(sh, dy);                   // reset counter saat pergantian shift walau tanpa cycle
             if (s.dirty) { s.dirty = false; dirtyLines.add(Number(s.line)); }
