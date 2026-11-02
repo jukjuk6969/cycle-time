@@ -84,7 +84,7 @@ const STATE_LABEL = {
   CAMERA_OFFLINE: "Camera Offline",
   OFFLINE: "Offline",
   SAVING_MODE: "Saving Mode",
-  GOD_MODE: "God Mode",
+  GOD_MODE: "Full Mode",
 };
 
 const ACTIVE = ["RUNNING", "TRANSIT"];
@@ -421,8 +421,8 @@ useEffect(() => {
     liveState === "OFFLINE" && !savingMode
       ? "FD offline"
       : savingMode
-        ? "Saving Mode aktif. Klik untuk kembali ke God Mode"
-        : "God Mode aktif. Klik untuk masuk Saving Mode"
+        ? "Saving Mode aktif. Klik untuk kembali ke Full Mode"
+        : "Full Mode aktif. Klik untuk masuk Saving Mode"
   }
   onClick={toggleMode}
   onKeyDown={(e) => e.stopPropagation()}
