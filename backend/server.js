@@ -16,11 +16,16 @@
  */
 
 require("dotenv").config();
+// PORT_FAMILY=9000 -> PORT=9001, HB_PORT=9002. Variabel eksplisit (PORT / HB_PORT) tetap menang bila diisi.
+const FAMILY = Number(process.env.PORT_FAMILY) || 0;
+const portOf = (name, offset, fallback) =>
+  Number(process.env[name]) || (FAMILY ? FAMILY + offset : fallback);
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const db = require("./db");
+const auth = require("./auth");
 const os = require("os");
 const net = require("net");
 const engine = require("./engine");
@@ -36,9 +41,7 @@ function emitCfg(line, station_id, ev, payload) {     // perubahan konfigurasi: 
   io.to([...roomsOf(line), `fd:${Number(line)}-${Number(station_id)}`]).emit(ev, payload);
 }
 
-const HB_PORT = Number(process.env.HB_PORT || 5002);
-
-
+const HB_PORT = portOf("HB_PORT", 2, 5002);
 const sessions = new Map();           // "line-station" -> { sock, gen, ip, offlineTimer }
 let genCounter = 0;
 const seenDirty = new Set();          // sesi yang perlu di-flush last_seen ke DB
@@ -288,7 +291,7 @@ const io = new Server(server, {
   perMessageDeflate: false,         // hemat CPU; payload kecil
   pingInterval: 20000, pingTimeout: 20000,
 });
-const PORT = process.env.PORT || 3000;
+const PORT = portOf("PORT", 0, 3000);
 app.use(cors({
   origin: allowedOrigins,
   exposedHeaders: ["Content-Range", "Accept-Ranges", "Content-Length", "X-Total-Count"],
@@ -310,6 +313,9 @@ app.use((req, res, next) => {
   });
   next();
 });
+// ── login dashboard: /api/auth/* (login/logout/me), lalu semua /api lain dijaga (kecuali route FD di auth.js) ──
+app.use("/api/auth", auth.router);
+app.use("/api", auth.guard);
 const { monitorEventLoopDelay } = require("perf_hooks");
 const loopH = monitorEventLoopDelay({ resolution: 20 });
 loopH.enable();
@@ -532,7 +538,28 @@ function proxyToFd(req, res, options, { forwardHeaders = [], requireOk = false }
 }
 
 
-app.get("/api/fd/:line/:station/stream", liveLimit, async (req, res) => {
+// ── layout tile dari FD (untuk klik -> slot) ──
+const lastLid = new Map();                       // "line-station" -> layout_id frame terakhir yang lewat di proxy
+const LID_TAG = Buffer.from("X-Layout-Id: ");
+function trackLayoutId(skey, chunk) {            // cari header per-part MJPEG tanpa mengubah byte yang diteruskan
+  const i = chunk.indexOf(LID_TAG);
+  if (i < 0) return;
+  const st = i + LID_TAG.length;
+  const en = chunk.indexOf(13, st);              // \r
+  if (en < 0 || en - st > 12) return;            // header terpotong di batas chunk: lewati, frame berikutnya akan membawanya
+  const n = Number(chunk.toString("latin1", st, en));
+  if (Number.isInteger(n)) lastLid.set(skey, n);
+}
+function hitTest(layout, nx, ny) {
+  if (!layout || !Array.isArray(layout.tiles)) return null;
+  for (const t of layout.tiles) {
+    const [x, y, w, h] = t.rect;
+    if (nx >= x && nx < x + w && ny >= y && ny < y + h) return t;
+  }
+  return null;                                   // klik di sel kosong (grid tidak penuh)
+}
+
+app.get(["/api/fd/:line/:station/stream", "/api/fd/:line/:station/stream/:slot"], liveLimit, async (req, res) => {
   let upstream = null;
   let fdRes = null;
   let cleaned = false;
@@ -576,10 +603,19 @@ app.get("/api/fd/:line/:station/stream", liveLimit, async (req, res) => {
 
     const fd = new URL(addr);
 
+    // /stream = kanvas tile (480px); /stream/:slot = satu source pada resolusi asli
+    let fdPath = "/stream";
+    if (req.params.slot !== undefined) {
+      const slot = Number(req.params.slot);
+      if (!Number.isInteger(slot) || slot < 0 || slot > 99)
+        return res.status(400).json({ error: "slot tidak valid" });
+      fdPath = `/stream/${slot}`;
+    }
+
     upstream = http.get({
       hostname: fd.hostname,
       port: fd.port,
-      path: "/stream",
+      path: fdPath,
       agent: false,
       headers: {
         "Cache-Control": "no-cache",
@@ -629,6 +665,7 @@ app.get("/api/fd/:line/:station/stream", liveLimit, async (req, res) => {
       response.socket?.setNoDelay(true);
 
       // Teruskan frame dari FD ke browser.
+      response.on("data", (c) => trackLayoutId(skey, c));   // hanya membaca; pipe tetap meneruskan byte apa adanya
       response.pipe(res);
     });
 
@@ -683,6 +720,36 @@ app.get("/api/fd/:line/:station/stream", liveLimit, async (req, res) => {
       });
     }
   }
+});
+app.get("/api/fd/:line/:station/layout", async (req, res) => {
+  const addr = await getFdAddress(req.params.line, req.params.station);
+  if (!addr) return res.status(503).json({ error: "FD offline atau tidak terdaftar" });
+  try {
+    res.set("Cache-Control", "no-store").json(await fdGetJson(addr, "/layout"));
+  } catch (e) {
+    res.status(502).json({ error: `FD tidak punya layout: ${e.message}` });
+  }
+});
+
+// body: { x, y } ternormalisasi 0..1 terhadap gambar stream yang tampil
+app.post("/api/fd/:line/:station/click", async (req, res) => {
+  const x = Number(req.body?.x), y = Number(req.body?.y);
+  if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1))
+    return res.status(400).json({ error: "x dan y harus 0..1" });
+  const skey = keyOf(req.params.line, req.params.station);
+  const addr = await getFdAddress(req.params.line, req.params.station);
+  if (!addr) return res.status(503).json({ error: "FD offline atau tidak terdaftar" });
+  let layout;
+  try { layout = await fdGetJson(addr, "/layout"); }
+  catch (e) { return res.status(502).json({ error: `FD tidak punya layout: ${e.message}` }); }
+
+  const seen = lastLid.get(skey);
+  if (seen && seen !== layout.layout_id)
+    return res.status(409).json({ error: "layout berubah, ulangi klik" });
+
+  const tile = hitTest(layout, x, y);
+  if (!tile) return res.status(404).json({ error: "tidak ada tile di titik itu" });
+  res.json({ slot: tile.slot, rect: tile.rect, layout_id: layout.layout_id });
 });
 app.get("/api/health", async (req, res) => {
   try {
@@ -861,6 +928,24 @@ app.get("/api/fd/:line/:station/video/:type/:filename", videoLimit, async (req, 
       { forwardHeaders: ["content-type", "content-length", "content-range", "accept-ranges"] });
   } catch (e) {
     if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
+});
+
+// Satu proxy layout video (S1..Sn -> koordinat di video gabungan). Dipakai video DB maupun buffer.
+app.get("/api/fd/:line/:station/video/:type/:filename/layout", async (req, res) => {
+  try {
+    const { line, station, type, filename } = req.params;
+    if (!["normal", "anomaly"].includes(type))
+      return res.status(400).json({ error: "type harus normal atau anomaly" });
+    if (filename.includes("..") || filename.includes("/") || filename.includes("\\"))
+      return res.status(400).json({ error: "Nama file tidak valid" });
+    const addr = await getFdAddress(line, station);
+    if (!addr) return res.status(503).json({ error: "FD offline atau tidak terdaftar" });
+    const lay = await fdGetJson(addr, `/videos/${type}/${encodeURIComponent(filename)}/layout`);
+    res.set("Cache-Control", "private, max-age=3600").json(lay);   // layout melekat di file, tidak berubah
+  } catch (e) {
+    if (!res.headersSent)
+      res.status(e.message === "FD 404" ? 404 : 502).json({ error: e.message });
   }
 });
 
@@ -1565,8 +1650,12 @@ app.get("/api/storage/usage", async (req, res) => {
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+io.use((socket, next) => {      // tandai socket dengan user login (belum memblok: FD juga lewat sini)
+  socket.data.user = auth.userFromCookieHeader(socket.handshake.headers.cookie);
+  next();
+});
 io.on("connection", (socket) => {
-  log(`Dashboard connected: ${socket.id}`);
+  log(`Dashboard connected: ${socket.id}${socket.data.user ? ` user=${socket.data.user.username}` : ""}`);
   socket.join("all");
   socket.data.lines = [];
 
