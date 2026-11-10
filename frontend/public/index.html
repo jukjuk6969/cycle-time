@@ -5,6 +5,21 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>CT Monitor Dashboard</title>
+  <script>
+    // Terapkan tema tersimpan / preferensi OS sebelum React render (mencegah kilatan putih)
+    (function () {
+      try {
+        var m = localStorage.getItem("ctm-theme");
+        if (m !== "dark" && m !== "light") {
+          m = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        }
+        var r = document.documentElement;
+        r.setAttribute("data-theme", m);
+        r.classList.add(m);
+        r.style.colorScheme = m;
+      } catch (e) {}
+    })();
+  </script>
 </head>
 
 <body>
