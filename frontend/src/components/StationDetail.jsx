@@ -11,7 +11,7 @@ import {
   Box, Flex, Grid, Text, Button, Input, SimpleGrid, HStack, Badge,
   Table, Spinner, NativeSelect,
 } from "@chakra-ui/react";
-import { ANOMALY_STYLE, getAnomalyType, expectedList, getRowUi } from "../hooks/useSocket";
+import { ANOMALY_STYLE, getAnomalyType, expectedList, getRowUi, isAbort } from "../hooks/useSocket";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer,
 } from "recharts";
@@ -471,7 +471,7 @@ export default function StationDetail({
   historyRef.current = history;
 
   const reqId = useRef(0);
-
+  const acRef = useRef(null);
   const [filters, setFilters] = useState({
     shift: "",
     from: todayWIB(),
@@ -582,31 +582,36 @@ export default function StationDetail({
   useEffect(() => { setRoiLocal(null); }, [station?.roi_timeout_sec]);
 
   /* ---------- load data ---------- */
-  const loadAll = useCallback(
-    async (flt) => {
-      if (stationId == null) return;
-      const id = ++reqId.current;
-      setLoading(true);
-      try {
-        const q = toApiRange(flt);
-        const [hist, st] = await Promise.all([
-          fetchHistory(line, stationId, 100, q),
-          fetchStats(line, stationId, q),
-        ]);
-        if (id !== reqId.current) return;
-        setHistory(hist.slice(-100));
-        setStats(st);
-      } catch (e) {
-        if (id !== reqId.current) return;
-        console.error("Failed to load station data:", e);
-        setHistory([]);
-        setStats(null);
-      } finally {
-        if (id === reqId.current) setLoading(false);
-      }
-    },
-    [line, stationId, fetchHistory, fetchStats]
-  );
+const loadAll = useCallback(
+  async (flt) => {
+    if (stationId == null) return;
+    const id = ++reqId.current;
+
+    acRef.current?.abort();                 // batalkan request sebelumnya
+    const ac = new AbortController();
+    acRef.current = ac;
+
+    setLoading(true);
+    try {
+      const q = toApiRange(flt);
+      const [hist, st] = await Promise.all([
+        fetchHistory(line, stationId, 100, q, { signal: ac.signal }),
+        fetchStats(line, stationId, q, { signal: ac.signal }),
+      ]);
+      if (id !== reqId.current) return;
+      setHistory(hist.slice(-100));
+      setStats(st);
+    } catch (e) {
+      if (isAbort(e) || id !== reqId.current) return;
+      console.error("Failed to load station data:", e);
+      setHistory([]);
+      setStats(null);
+    } finally {
+      if (id === reqId.current) setLoading(false);
+    }
+  },
+  [line, stationId, fetchHistory, fetchStats]
+);
 
   useEffect(() => {
     loadAll(filters);
