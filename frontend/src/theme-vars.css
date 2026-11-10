@@ -1,0 +1,182 @@
+/* ───────────────────────────────────────────────────────────────────────
+   CT Monitor — design tokens (light / dark)
+   Mode diatur lewat <html data-theme="light|dark"> (lihat useThemeMode).
+   ─────────────────────────────────────────────────────────────────────── */
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* Surface */
+  --ct-canvas: #F4F6F8;
+  --ct-surface: #FFFFFF;
+  --ct-on-accent: #FFFFFF;
+
+  /* Teks & garis (skala ink) */
+  --ct-black: #231F20;
+  --ct-ink-700: #334155;
+  --ct-ink-600: #475569;
+  --ct-ink-500: #64748B;
+  --ct-ink-400: #94A3B8;
+  --ct-ink-300: #CBD5E1;
+  --ct-ink-200: #E2E8F0;
+  --ct-ink-100: #F1F5F9;
+  --ct-ink-50:  #F8FAFC;
+
+  /* Astra blue */
+  --ct-blue-rgb: 0, 90, 156;
+  --ct-blue: #005A9C;
+  --ct-blue-hover: #004880;
+  --ct-blue-active: #003A6B;
+  --ct-blue-700: #004A82;
+  --ct-blue-200: #99BFDD;
+  --ct-blue-100: #C5DAEC;
+  --ct-blue-50:  #EDF4FA;
+
+  /* Astra orange */
+  --ct-orange-rgb: 247, 148, 29;
+  --ct-orange: #F7941D;
+  --ct-orange-hover: #DE7E0A;
+  --ct-orange-700: #C5660A;
+  --ct-orange-200: #FAD1A0;
+  --ct-orange-100: #FCE4C5;
+  --ct-orange-50:  #FEF4E5;
+
+  /* Status */
+  --ct-red: #DC2626;
+  --ct-red-text: #B91C1C;
+  --ct-red-50: #FEF2F2;
+  --ct-purple: #9333EA;
+  --ct-purple-text: #6B21A8;
+
+  /* Bayangan & latar */
+  --ct-shadow-xs: 0 1px 2px rgba(35, 31, 32, .03);
+  --ct-shadow-sm: 0 1px 3px rgba(35, 31, 32, .06);
+  --ct-shadow-md: 0 8px 18px -6px rgba(35, 31, 32, .14);
+  --ct-shadow-lg: 0 18px 40px -12px rgba(35, 31, 32, .22);
+  --ct-grid: rgba(var(--ct-blue-rgb), .025);
+  --ct-overlay: rgba(15, 23, 42, .45);
+
+  /* Token tambahan (state kartu, gradasi progress, bayangan drawer) */
+  --ct-red-rgb: 220, 38, 38;
+  --ct-purple-rgb: 147, 51, 234;
+  --ct-slate-rgb: 148, 163, 184;
+  --ct-orange-strong: #F58025;
+  --ct-orange-text: #C2410C;
+  --ct-orange-light: #FBA94C;
+  --ct-red-light: #EF4444;
+  --ct-blue-light: #2B7BBF;
+  --ct-shadow-drawer: -8px 0 24px rgba(35, 31, 32, .10);
+  --ct-green: #22C55E;
+  --ct-icon-plate: transparent; /* alas di belakang ikon diagram konektivitas */
+  --ct-yellow: #CA8A04;
+  --ct-cyan: #0891B2;
+  /* Warna anomali (useSocket.js) */
+  --ct-anom-ok: #2e7d32;
+  --ct-anom-long: #c62828;
+  --ct-anom-short: #ef6c00;
+  --ct-anom-skip: #b7791f;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --ct-canvas: #0B1220;
+  --ct-surface: #111A2B;
+  --ct-on-accent: #0B1220; /* teks di atas biru/oranye terang */
+
+  --ct-black: #E8EDF4;
+  --ct-ink-700: #C3CDDB;
+  --ct-ink-600: #A7B4C7;
+  --ct-ink-500: #8A99AF;
+  --ct-ink-400: #6B7C93;
+  --ct-ink-300: #34435E;
+  --ct-ink-200: #26334A;
+  --ct-ink-100: #1A2438;
+  --ct-ink-50:  #151F31;
+
+  --ct-blue-rgb: 77, 163, 224;
+  --ct-blue: #4DA3E0;
+  --ct-blue-hover: #6DB5E8;
+  --ct-blue-active: #8CC6EE;
+  --ct-blue-700: #8CC6EE;
+  --ct-blue-200: #24557F;
+  --ct-blue-100: #183A59;
+  --ct-blue-50:  #122A42;
+
+  --ct-orange-rgb: 247, 164, 64;
+  --ct-orange: #F7A440;
+  --ct-orange-hover: #FBB86A;
+  --ct-orange-700: #FBB86A;
+  --ct-orange-200: #5C3C14;
+  --ct-orange-100: #3D2912;
+  --ct-orange-50:  #2B1E10;
+
+  --ct-red: #F87171;
+  --ct-red-text: #FCA5A5;
+  --ct-red-50: #2E1618;
+  --ct-purple: #C084FC;
+  --ct-purple-text: #D8B4FE;
+
+  --ct-shadow-xs: 0 1px 2px rgba(0, 0, 0, .35);
+  --ct-shadow-sm: 0 1px 3px rgba(0, 0, 0, .45);
+  --ct-shadow-md: 0 8px 20px -6px rgba(0, 0, 0, .55);
+  --ct-shadow-lg: 0 18px 44px -12px rgba(0, 0, 0, .7);
+  --ct-grid: rgba(var(--ct-blue-rgb), .05);
+  --ct-overlay: rgba(2, 6, 14, .7);
+
+  /* Token tambahan (state kartu, gradasi progress, bayangan drawer) */
+  --ct-red-rgb: 248, 113, 113;
+  --ct-purple-rgb: 192, 132, 252;
+  --ct-slate-rgb: 138, 153, 175;
+  --ct-orange-strong: #F9A04A;
+  --ct-orange-text: #FDBA74;
+  --ct-orange-light: #FBC074;
+  --ct-red-light: #FCA5A5;
+  --ct-blue-light: #7BBDEB;
+  --ct-shadow-drawer: -8px 0 28px rgba(0, 0, 0, .6);
+  --ct-green: #4ADE80;
+  --ct-icon-plate: rgba(232, 237, 244, .92);
+  --ct-yellow: #FACC15;
+  --ct-cyan: #22D3EE;
+  --ct-anom-ok: #4ADE80;
+  --ct-anom-long: #F87171;
+  --ct-anom-short: #FB923C;
+  --ct-anom-skip: #FACC15;
+}
+
+body {
+  margin: 0;
+  background: var(--ct-canvas);
+  color: var(--ct-black);
+}
+
+/* Transisi halus saat tema berganti (kelas dipasang sementara oleh useThemeMode) */
+:root.ctm-theme-anim *,
+:root.ctm-theme-anim *::before,
+:root.ctm-theme-anim *::after {
+  transition:
+    background-color 280ms ease,
+    border-color 280ms ease,
+    color 280ms ease,
+    fill 280ms ease,
+    stroke 280ms ease,
+    box-shadow 280ms ease !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root.ctm-theme-anim *,
+  :root.ctm-theme-anim *::before,
+  :root.ctm-theme-anim *::after {
+    transition: none !important;
+  }
+}
+
+/* Autofill browser (kuning/putih) disesuaikan agar tidak merusak mode gelap */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px var(--ct-canvas) inset;
+  -webkit-text-fill-color: var(--ct-black);
+  caret-color: var(--ct-black);
+  transition: background-color 9999s ease-in-out 0s;
+}

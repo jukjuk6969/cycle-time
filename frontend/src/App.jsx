@@ -16,6 +16,8 @@ import StationTimeline from "./components/StationTimeline";
 import StationRegister from "./components/StationRegister";
 import logoGif from "./assets/logo.png";
 import { AuthProvider } from "./hooks/useAuth";
+import { ThemeModeProvider } from "./hooks/useThemeMode";
+import ThemeToggle from "./components/ThemeToggle";
 import AuthGate from "./components/AuthGate";
 import UserMenu from "./components/UserMenu";
 import LineGroups from "./components/LineGroups";
@@ -23,12 +25,12 @@ import StationDrawer, { DRAWER_W, usePushLayout } from "./components/StationDraw
 
 /* ── Palette ─────────────────────────────────────────────────────────── */
 const P = {
-  blue: "#005A9C", blueActive: "#003A6B",
-  blue700: "#004A82", blue200: "#99BFDD", blue100: "#C5DAEC", blue50: "#EDF4FA",
-  orange: "#F7941D", orange700: "#C5660A", orange100: "#FCE4C5", orange50: "#FEF4E5",
-  black: "#231F20",
-  ink600: "#475569", ink500: "#64748B", ink300: "#CBD5E1", ink200: "#E2E8F0",
-  white: "#FFFFFF", canvas: "#F4F6F8",
+  blue: "var(--ct-blue)", blueActive: "var(--ct-blue-active)",
+  blue700: "var(--ct-blue-700)", blue200: "var(--ct-blue-200)", blue100: "var(--ct-blue-100)", blue50: "var(--ct-blue-50)",
+  orange: "var(--ct-orange)", orange700: "var(--ct-orange-700)", orange100: "var(--ct-orange-100)", orange50: "var(--ct-orange-50)",
+  black: "var(--ct-black)",
+  ink600: "var(--ct-ink-600)", ink500: "var(--ct-ink-500)", ink300: "var(--ct-ink-300)", ink200: "var(--ct-ink-200)",
+  white: "var(--ct-surface)", canvas: "var(--ct-canvas)",
 };
 
 /* ── Type / space / size ─────────────────────────────────────────────── */
@@ -45,8 +47,8 @@ const FOCUS_BLUE = { boxShadow: `0 0 0 3px ${P.blue100}` };
 
 /* ── Keyframes ───────────────────────────────────────────────────────── */
 const KEYFRAMES = `
-@keyframes astra-pulse      { 0%{box-shadow:0 0 0 0 rgba(0,90,156,.35)} 70%{box-shadow:0 0 0 5px rgba(0,90,156,0)} 100%{box-shadow:0 0 0 0 rgba(0,90,156,0)} }
-@keyframes astra-pulse-warn { 0%{box-shadow:0 0 0 0 rgba(247,148,29,.4)} 70%{box-shadow:0 0 0 5px rgba(247,148,29,0)} 100%{box-shadow:0 0 0 0 rgba(247,148,29,0)} }
+@keyframes astra-pulse      { 0%{box-shadow:0 0 0 0 rgba(var(--ct-blue-rgb),.35)} 70%{box-shadow:0 0 0 5px rgba(var(--ct-blue-rgb),0)} 100%{box-shadow:0 0 0 0 rgba(var(--ct-blue-rgb),0)} }
+@keyframes astra-pulse-warn { 0%{box-shadow:0 0 0 0 rgba(var(--ct-orange-rgb),.4)} 70%{box-shadow:0 0 0 5px rgba(var(--ct-orange-rgb),0)} 100%{box-shadow:0 0 0 0 rgba(var(--ct-orange-rgb),0)} }
 @keyframes astra-slide      { from{opacity:0;transform:translateY(-6px)} to{opacity:1;transform:translateY(0)} }
 @keyframes astra-fade       { from{opacity:0} to{opacity:1} }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
@@ -57,13 +59,15 @@ const stKey = (s) => `${s.line}-${s.station_id}`;
 /* ── App ─────────────────────────────────────────────────────────────── */
 export default function App() {
   return (
-    <AuthProvider>
-      <ChakraProvider value={system}>
-        <AuthGate>
-          <Dashboard />
-        </AuthGate>
-      </ChakraProvider>
-    </AuthProvider>
+    <ThemeModeProvider>
+      <AuthProvider>
+        <ChakraProvider value={system}>
+          <AuthGate>
+            <Dashboard />
+          </AuthGate>
+        </ChakraProvider>
+      </AuthProvider>
+    </ThemeModeProvider>
   );
 }
 
@@ -95,7 +99,7 @@ function Dashboard() {
         "&::before": {
           content: '""', position: "absolute", inset: 0, pointerEvents: "none",
           backgroundImage:
-            "linear-gradient(to right, rgba(0,90,156,.025) 1px, transparent 1px), linear-gradient(to bottom, rgba(0,90,156,.025) 1px, transparent 1px)",
+            "linear-gradient(to right, var(--ct-grid) 1px, transparent 1px), linear-gradient(to bottom, var(--ct-grid) 1px, transparent 1px)",
           backgroundSize: "32px 32px",
           animation: "astra-fade 900ms ease-out",
         },
@@ -155,7 +159,7 @@ function Header({ connected, onOpenRegister }) {
       bg={P.white} borderBottomWidth="1px" borderColor={P.ink200}
       align={{ base: "stretch", md: "center" }} justify="space-between"
       gap={SP.md} direction={{ base: "column", md: "row" }}
-      boxShadow="0 1px 2px rgba(35,31,32,.02)"
+      boxShadow="0 1px 2px rgba(0,0,0,.04)"
       position="relative" zIndex={10}
     >
       <BrandBlock subtitle="Final Assembly" />
@@ -178,6 +182,7 @@ function Header({ connected, onOpenRegister }) {
           Station Register
         </Button>
         <ConnectionPill connected={connected} />
+        <ThemeToggle size={SZ.action} />
         <UserMenu />
       </Flex>
     </Flex>
@@ -282,7 +287,7 @@ function SelectedStationDetail({
         mb={SP.lg} p={SP.lg} bg={P.white}
         borderWidth="1px" borderColor={P.ink200}
         borderLeftWidth="3px" borderLeftColor={P.blue}
-        borderRadius={RADII.lg} boxShadow="0 1px 3px rgba(35,31,32,.02)"
+        borderRadius={RADII.lg} boxShadow="0 1px 3px rgba(0,0,0,.04)"
       >
         <HStack mb={SP.md} gap={SP.sm}>
           <Box w="6px" h="6px" bg={P.orange} flexShrink={0} aria-hidden="true" />
@@ -321,20 +326,23 @@ function StationRegisterPage({ onBack }) {
         h={SZ.header} px={PX} bg={P.white}
         borderBottomWidth="1px" borderColor={P.ink200}
         align="center" justify="space-between"
-        boxShadow="0 1px 2px rgba(35,31,32,.02)"
+        boxShadow="0 1px 2px rgba(0,0,0,.04)"
       >
         <BrandBlock subtitle="Station Register" />
-        <Button
-          variant="outline" onClick={onBack}
-          h={SZ.action} px={SP.lg}
-          fontSize={FS.tiny} fontWeight="700" fontFamily={MONO}
-          letterSpacing="0.08em" textTransform="uppercase"
-          borderRadius={RADII.md} borderColor={P.ink200} color={P.ink600} bg={P.white}
-          _hover={{ bg: P.blue50, borderColor: P.blue200, color: P.blue }}
-          _focusVisible={FOCUS_BLUE}
-        >
-          Back to Dashboard
-        </Button>
+        <HStack gap={SP.md}>
+          <ThemeToggle size={SZ.action} />
+          <Button
+            variant="outline" onClick={onBack}
+            h={SZ.action} px={SP.lg}
+            fontSize={FS.tiny} fontWeight="700" fontFamily={MONO}
+            letterSpacing="0.08em" textTransform="uppercase"
+            borderRadius={RADII.md} borderColor={P.ink200} color={P.ink600} bg={P.white}
+            _hover={{ bg: P.blue50, borderColor: P.blue200, color: P.blue }}
+            _focusVisible={FOCUS_BLUE}
+          >
+            Back to Dashboard
+          </Button>
+        </HStack>
       </Flex>
       <Box maxW="1800px" mx="auto" p={PX} style={{ animation: "astra-slide 400ms ease" }}>
         <StationRegister onBack={onBack} />
