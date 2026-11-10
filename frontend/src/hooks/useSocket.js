@@ -4,9 +4,9 @@ import axios from "axios";
 import { BASE_URL } from "../config";
 
 export const ANOMALY_STYLE = {
-  OK: { label: "OK", color: "#2e7d32" },
-  LONG: { label: "LONG", color: "#c62828" },
-  SHORT: { label: "SHORT", color: "#ef6c00" },
+  OK: { label: "OK", color: "var(--ct-anom-ok)" },
+  LONG: { label: "LONG", color: "var(--ct-anom-long)" },
+  SHORT: { label: "SHORT", color: "var(--ct-anom-short)" },
 };
 export const TYPE_UI = {
   OK: { palette: "green", label: "OK", bg: "white", hover: "gray.50", text: "gray.800", bar: null },
@@ -23,7 +23,7 @@ export function getAnomalyType(row) {
  * terlewat). Server menyimpan keterangannya di skipped_expected,
  * dipisah "; " (mis. "LCD; mask"), dan teks lengkapnya di anomaly_label.
  * ---------------------------------------------------------------------- */
-export const EXPECTED_STYLE = { label: "Skipped", color: "#b7791f" };
+export const EXPECTED_STYLE = { label: "Skipped", color: "var(--ct-anom-skip)" };
 export const EXPECTED_UI = {
   palette: "yellow", label: "Skipped",
   bg: "yellow.50", hover: "yellow.100", text: "yellow.800", bar: "yellow",
