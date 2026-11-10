@@ -14,9 +14,9 @@ export default function AuthGate({ children }) {
   
   if (loading)
     return (
-      <Flex minH="100vh" align="center" justify="center" bg="#F4F6F8" direction="column" gap={4}>
-        <Box w="8px" h="8px" bg="#F58025" borderRadius="full" style={{ animation: "pulse 1.5s infinite" }} />
-        <Text fontFamily={MONO} fontSize="12px" color="#64748B" letterSpacing="0.1em">
+      <Flex minH="100vh" align="center" justify="center" bg="var(--ct-canvas)" direction="column" gap={4}>
+        <Box w="8px" h="8px" bg="var(--ct-orange-strong)" borderRadius="full" style={{ animation: "pulse 1.5s infinite" }} />
+        <Text fontFamily={MONO} fontSize="12px" color="var(--ct-ink-500)" letterSpacing="0.1em">
           VERIFYING SESSION...
         </Text>
       </Flex>

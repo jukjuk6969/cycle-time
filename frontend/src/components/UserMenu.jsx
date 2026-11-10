@@ -53,35 +53,35 @@ import { useAuth } from "../hooks/useAuth";
 
 const P = {
   /* ── Brand blue ──────────────────────────────────────────────────────── */
-  blue: "#005A9C",          // primary brand
-  blueHover: "#004880",     // darker shade for hover on solid fills
-  blueActive: "#003A6B",    // pressed state on solid fills
-  blue700: "#004A82",       // fg on light bg (AA-compliant at 13px+)
-  blue200: "#99BFDD",       // border tint for soft blue chips
-  blue100: "#C5DAEC",       // hover border tint
-  blue50: "#EDF4FA",        // surface tint for subtle blue fills
+  blue: "var(--ct-blue)",          // primary brand
+  blueHover: "var(--ct-blue-hover)",     // darker shade for hover on solid fills
+  blueActive: "var(--ct-blue-active)",    // pressed state on solid fills
+  blue700: "var(--ct-blue-700)",       // fg on light bg (AA-compliant at 13px+)
+  blue200: "var(--ct-blue-200)",       // border tint for soft blue chips
+  blue100: "var(--ct-blue-100)",       // hover border tint
+  blue50: "var(--ct-blue-50)",        // surface tint for subtle blue fills
 
   /* ── Brand orange ────────────────────────────────────────────────────── */
-  orange: "#F7941D",        // secondary brand
-  orangeHover: "#DE7E0A",   // darker shade for hover
-  orange700: "#C5660A",     // fg on light bg (AA-compliant)
-  orange200: "#FAD1A0",     // border tint
-  orange100: "#FCE4C5",     // hover border tint
-  orange50: "#FEF4E5",      // surface tint
+  orange: "var(--ct-orange)",        // secondary brand
+  orangeHover: "var(--ct-orange-hover)",   // darker shade for hover
+  orange700: "var(--ct-orange-700)",     // fg on light bg (AA-compliant)
+  orange200: "var(--ct-orange-200)",     // border tint
+  orange100: "var(--ct-orange-100)",     // hover border tint
+  orange50: "var(--ct-orange-50)",      // surface tint
 
   /* ── Ink scale ───────────────────────────────────────────────────────── */
-  black: "#231F20",         // brand ink — primary typography
-  ink900: "#0F172A",        // deep slate
-  ink800: "#1E293B",
-  ink700: "#334155",        // strong secondary text
-  ink600: "#475569",        // secondary text
-  ink500: "#64748B",        // tertiary text
-  ink400: "#94A3B8",        // disabled / placeholder
-  ink300: "#CBD5E1",        // heavy border
-  ink200: "#E2E8F0",        // standard border
-  ink100: "#F1F5F9",        // light surface
-  ink50: "#F8FAFC",         // lightest surface
-  white: "#FFFFFF",         // page background
+  black: "var(--ct-black)",         // brand ink — primary typography
+  ink900: "var(--ct-black)",        // deep slate
+  ink800: "var(--ct-ink-700)",
+  ink700: "var(--ct-ink-700)",        // strong secondary text
+  ink600: "var(--ct-ink-600)",        // secondary text
+  ink500: "var(--ct-ink-500)",        // tertiary text
+  ink400: "var(--ct-ink-400)",        // disabled / placeholder
+  ink300: "var(--ct-ink-300)",        // heavy border
+  ink200: "var(--ct-ink-200)",        // standard border
+  ink100: "var(--ct-ink-100)",        // light surface
+  ink50: "var(--ct-ink-50)",         // lightest surface
+  white: "var(--ct-surface)",         // page background
 };
 
 /* ============================================================================
@@ -167,7 +167,7 @@ const H = {
 
 const ELEV = {
   hair: `inset 0 0 0 1px ${P.ink200}`,
-  sm: `0 1px 2px rgba(35,31,32,0.04)`,
+  sm: `var(--ct-shadow-xs)`,
 };
 
 /* ============================================================================

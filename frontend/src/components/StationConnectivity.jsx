@@ -9,11 +9,11 @@ import databaseImg from "../assets/connectivity/database.png";
 import { BASE_URL } from "../config";
 
 const P = {
-  blue: "#005A9C",
-  orange: "#F7941D",
-  orange700: "#C5660A",
-  ink700: "#334155",
-  ink400: "#94A3B8",
+  blue: "var(--ct-blue)",
+  orange: "var(--ct-orange)",
+  orange700: "var(--ct-orange-700)",
+  ink700: "var(--ct-ink-700)",
+  ink400: "var(--ct-ink-400)",
 };
 
 const COLOR = {
@@ -217,6 +217,14 @@ export default function StationConnectivity({ heartbeat, connected, dbOk }) {
                 fill={COLOR[st]}
                 opacity="0.12"
                 className={st === "ok" ? "ctc-halo" : undefined}
+              />
+              <rect
+                x={node.x - ICON / 2 - 4}
+                y={node.y - ICON / 2 - 4}
+                width={ICON + 8}
+                height={ICON + 8}
+                rx="10"
+                fill="var(--ct-icon-plate)"
               />
               <image
                 href={node.image}

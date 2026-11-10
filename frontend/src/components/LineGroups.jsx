@@ -34,7 +34,7 @@ export function groupByLine(stations = []) {
 
 function LineHeader({ line, summary, open, onToggle, panelId }) {
   const { total, problem, offline, running } = summary;
-  const tone = problem > 0 ? "#DC2626" : offline === total ? "#94A3B8" : "#005A9C";
+  const tone = problem > 0 ? "var(--ct-red)" : offline === total ? "var(--ct-ink-400)" : "var(--ct-blue)";
 
   return (
     <Flex
@@ -49,33 +49,33 @@ function LineHeader({ line, summary, open, onToggle, panelId }) {
       gap={3}
       px={4}
       py={3}
-      bg="white"
+      bg="var(--ct-surface)"
       borderWidth="1px"
-      borderColor="#E2E8F0"
+      borderColor="var(--ct-ink-200)"
       borderLeftWidth="4px"
       borderLeftColor={tone}
       borderRadius="4px"
       textAlign="left"
       cursor="pointer"
-      _hover={{ bg: "#F8FAFC" }}
-      _focusVisible={{ outline: "2px solid #005A9C", outlineOffset: "2px" }}
+      _hover={{ bg: "var(--ct-ink-50)" }}
+      _focusVisible={{ outline: "2px solid var(--ct-blue)", outlineOffset: "2px" }}
     >
       <Flex align="baseline" gap={3} minW={0}>
-        <Text fontSize="15px" fontWeight="700" color="#231F20">
+        <Text fontSize="15px" fontWeight="700" color="var(--ct-black)">
           Line {line}
         </Text>
-        <Text fontSize="12px" color="#64748B">
+        <Text fontSize="12px" color="var(--ct-ink-500)">
           {total} station
         </Text>
       </Flex>
 
       <Flex align="center" gap={4} fontFamily={MONO} fontSize="11px" fontWeight="600">
-        {problem > 0 && <Text color="#DC2626">{problem} bermasalah</Text>}
-        {offline > 0 && <Text color="#94A3B8">{offline} offline</Text>}
-        <Text color="#005A9C">
+        {problem > 0 && <Text color="var(--ct-red)">{problem} bermasalah</Text>}
+        {offline > 0 && <Text color="var(--ct-ink-400)">{offline} offline</Text>}
+        <Text color="var(--ct-blue)">
           {running}/{total} aktif
         </Text>
-        <Text color="#64748B" aria-hidden="true">
+        <Text color="var(--ct-ink-500)" aria-hidden="true">
           {open ? "▾" : "▸"}
         </Text>
       </Flex>
@@ -151,7 +151,7 @@ export default function LineGroups({ stations, heartbeats = {}, selectedKey, onS
 
   if (groups.length === 0) {
     return (
-      <Text fontSize="13px" color="#64748B">
+      <Text fontSize="13px" color="var(--ct-ink-500)">
         Belum ada station terdaftar.
       </Text>
     );

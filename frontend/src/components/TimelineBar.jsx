@@ -7,10 +7,10 @@ const fmtS = (v) => `${Number(v).toFixed(v % 1 ? 1 : 0)}s`;
 // Warna zona berdasarkan posisi waktu t
 // zoneAt: tanpa roi
 function zoneAt(t, { min, short, target }) {
-    if (min != null && t < min) return { bg: "gray.400", name: "Diabaikan" };
-    if (short != null && t < short) return { bg: "orange.400", name: "Short" };
-    if (target != null && t < target) return { bg: "green.500", name: "Normal" };
-    return { bg: "red.500", name: "Long" };
+    if (min != null && t < min) return { bg: "var(--ct-ink-400)", name: "Diabaikan" };
+    if (short != null && t < short) return { bg: "var(--ct-orange)", name: "Short" };
+    if (target != null && t < target) return { bg: "var(--ct-green)", name: "Normal" };
+    return { bg: "var(--ct-red)", name: "Long" };
 }
 
 export default function TimelineBar({ elapsed, min, short, target, active }) {
@@ -26,7 +26,7 @@ export default function TimelineBar({ elapsed, min, short, target, active }) {
 
     if (marks.length === 0)
         return (
-            <Text fontSize="11px" color="red.500">
+            <Text fontSize="11px" color="var(--ct-red)">
                 Limit empty time: min={String(min)}, short={String(short)}, target={String(target)}
             </Text>
         );
@@ -84,7 +84,7 @@ export default function TimelineBar({ elapsed, min, short, target, active }) {
                 const above = i % 2 === 0;
                 return (
                     <Box key={m.key} position="absolute" left={`${pct(m.v)}%`} top="0" bottom="0" w="0">
-                        <Box position="absolute" left="-0.5px" top="13px" w="1px" h="12px" bg="gray.600" />
+                        <Box position="absolute" left="-0.5px" top="13px" w="1px" h="12px" bg="var(--ct-ink-600)" />
                         <Text
                             position="absolute"
                             left="0"
@@ -92,7 +92,7 @@ export default function TimelineBar({ elapsed, min, short, target, active }) {
                             {...(above ? { top: "-1px" } : { bottom: "-1px" })}
                             fontSize="9px"
                             lineHeight="1"
-                            color="gray.500"
+                            color="var(--ct-ink-500)"
                             whiteSpace="nowrap"
                             style={{ fontVariantNumeric: "tabular-nums" }}
                         >

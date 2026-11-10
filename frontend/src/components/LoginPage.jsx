@@ -6,6 +6,7 @@ import React, { useState, useRef, useEffect } from "react";
 import { Box, Button, Flex, Input, Text, VStack, HStack } from "@chakra-ui/react";
 
 import { useAuth } from "../hooks/useAuth";
+import ThemeToggle from "./ThemeToggle";
 
 const KEYFRAMES = `
 @keyframes lp-rise {
@@ -39,13 +40,18 @@ const KEYFRAMES = `
 `;
 
 // Astra Visteon Palette
-const BRAND_BLUE = "#005A9C"; 
-const BRAND_BLUE_DARK = "#003A66"; 
-const BRAND_ORANGE = "#F58025"; 
+// Panel KIRI (visual merek) sengaja tetap biru tua di kedua tema -> pakai hex tetap.
+const BRAND_BLUE = "#005A9C";
+const BRAND_BLUE_DARK = "#003A66";
+const BRAND_ORANGE = "#F58025";
 const STATUS_GREEN = "#10B981";
-const CHARCOAL = "#231F20"; 
-const PAPER = "#FFFFFF";
-const GRAY_BG = "#F4F6F8";
+const ON_BRAND = "#FFFFFF"; // teks putih di atas panel biru & tombol oranye
+
+// Panel KANAN (formulir) mengikuti tema.
+const CHARCOAL = "var(--ct-black)";
+const PAPER = "var(--ct-surface)";
+const GRAY_BG = "var(--ct-canvas)";
+const ACCENT_BLUE = "var(--ct-blue)";
 
 const SANS = `"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
 const MONO = `"JetBrains Mono", "SF Mono", ui-monospace, "Cascadia Code", Consolas, monospace`;
@@ -90,20 +96,20 @@ export default function LoginPage() {
     borderRadius: "4px",
     bg: GRAY_BG,
     border: "1px solid",
-    borderColor: "#E2E8F0",
+    borderColor: "var(--ct-ink-200)",
     px: "4",
     fontFamily: MONO,
     fontSize: "14px",
     color: CHARCOAL,
     letterSpacing: "0.02em",
-    _placeholder: { color: "#A0AEC0" },
-    _hover: { borderColor: "#CBD5E0" },
+    _placeholder: { color: "var(--ct-ink-400)" },
+    _hover: { borderColor: "var(--ct-ink-300)" },
     transition: "border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease",
     _focus: {
       outline: "none",
       bg: PAPER,
-      borderColor: BRAND_BLUE,
-      boxShadow: `0 0 0 3px ${BRAND_BLUE}20`,
+      borderColor: ACCENT_BLUE,
+      boxShadow: "0 0 0 3px rgba(var(--ct-blue-rgb),.18)",
     },
   };
 
@@ -120,7 +126,7 @@ export default function LoginPage() {
         flex="1"
         position="relative"
         bg={BRAND_BLUE_DARK}
-        color={PAPER}
+        color={ON_BRAND}
         overflow="hidden"
         style={{ animation: "lp-slide 700ms cubic-bezier(0.22,1,0.36,1) both" }}
       >
@@ -203,7 +209,7 @@ export default function LoginPage() {
                 boxShadow={`0 0 12px ${STATUS_GREEN}`}
                 style={{ animation: "lp-blink 2.4s ease-in-out infinite" }}
               />
-              <Text fontSize="11px" fontWeight="600" letterSpacing="0.2em" color={PAPER} fontFamily={MONO}>
+              <Text fontSize="11px" fontWeight="600" letterSpacing="0.2em" color={ON_BRAND} fontFamily={MONO}>
                 ASTRA VISTEON INDONESIA
               </Text>
             </HStack>
@@ -234,7 +240,7 @@ export default function LoginPage() {
               lineHeight="1.05"
               fontWeight="700"
               letterSpacing="-0.02em"
-              color={PAPER}
+              color={ON_BRAND}
               fontFamily={SANS}
             >
               Precision in
@@ -315,6 +321,11 @@ export default function LoginPage() {
         px={{ base: "6", md: "14" }}
         position="relative"
       >
+        {/* Toggle tema (login tampil sebelum header ada) */}
+        <Box position="absolute" top="16px" right="16px" zIndex={2}>
+          <ThemeToggle />
+        </Box>
+
         {/* Top scanline */}
         <Box
           aria-hidden
@@ -347,11 +358,11 @@ export default function LoginPage() {
             {/* Form Header */}
             <Box>
               <HStack gap="2" mb="4">
-                <Box w="8px" h="8px" bg={BRAND_BLUE} />
+                <Box w="8px" h="8px" bg={ACCENT_BLUE} />
                 <Text
                   fontSize="10.5px"
                   letterSpacing="0.2em"
-                  color={BRAND_BLUE}
+                  color={ACCENT_BLUE}
                   fontWeight="700"
                   fontFamily={MONO}
                 >
@@ -368,12 +379,12 @@ export default function LoginPage() {
               >
                 Welcome
               </Text>
-              <Text fontSize="14px" color="#64748B" mt="2" lineHeight="1.6">
+              <Text fontSize="14px" color="var(--ct-ink-500)" mt="2" lineHeight="1.6">
                 Authentication is required to access the manufacturing dashboard.
               </Text>
             </Box>
 
-            <Box h="1px" bg="#E2E8F0" />
+            <Box h="1px" bg="var(--ct-ink-200)" />
 
             {/* Username */}
             <Box>
@@ -387,7 +398,7 @@ export default function LoginPage() {
                 >
                   USERNAME
                 </Text>
-                <Text fontSize="10px" color="#94A3B8" fontFamily={MONO} letterSpacing="0.1em">
+                <Text fontSize="10px" color="var(--ct-ink-400)" fontFamily={MONO} letterSpacing="0.1em">
                   REQUIRED
                 </Text>
               </HStack>
@@ -414,7 +425,7 @@ export default function LoginPage() {
                 >
                   PASSWORD
                 </Text>
-                <Text fontSize="10px" color="#94A3B8" fontFamily={MONO} letterSpacing="0.1em">
+                <Text fontSize="10px" color="var(--ct-ink-400)" fontFamily={MONO} letterSpacing="0.1em">
                   ENCRYPTED
                 </Text>
               </HStack>
@@ -436,16 +447,16 @@ export default function LoginPage() {
                 tabIndex={-1}
                 role="alert"
                 border="1px solid"
-                borderColor="#FECACA"
-                bg="#FEF2F2"
+                borderColor="rgba(var(--ct-red-rgb),.35)"
+                bg="var(--ct-red-50)"
                 borderRadius="4px"
                 px="4"
                 py="3"
                 style={{ animation: "lp-fade 220ms ease both" }}
               >
                 <HStack gap="2.5" align="flex-start">
-                  <Box mt="6px" w="6px" h="6px" borderRadius="full" bg="#DC2626" flexShrink="0" />
-                  <Text fontSize="13px" color="#991B1B" fontFamily={SANS} fontWeight="500" lineHeight="1.5">
+                  <Box mt="6px" w="6px" h="6px" borderRadius="full" bg="var(--ct-red)" flexShrink="0" />
+                  <Text fontSize="13px" color="var(--ct-red-text)" fontFamily={SANS} fontWeight="500" lineHeight="1.5">
                     {error}
                   </Text>
                 </HStack>
@@ -459,7 +470,7 @@ export default function LoginPage() {
               h="50px"
               borderRadius="4px"
               bg={BRAND_ORANGE}
-              color={PAPER}
+              color={ON_BRAND}
               fontWeight="700"
               fontSize="13px"
               letterSpacing="0.15em"
@@ -468,16 +479,16 @@ export default function LoginPage() {
               transition="background-color 160ms ease, transform 120ms ease, opacity 160ms ease, box-shadow 200ms ease"
               _hover={!disabled ? { bg: "#E6731A", boxShadow: `0 6px 20px -8px ${BRAND_ORANGE}80` } : undefined}
               _active={!disabled ? { transform: "translateY(1px)" } : undefined}
-              _disabled={{ opacity: 0.5, cursor: "not-allowed", bg: "#CBD5E0" }}
+              _disabled={{ opacity: 0.5, cursor: "not-allowed", bg: "var(--ct-ink-300)" }}
             >
               {busy ? "AUTHENTICATING..." : "SIGN IN TO SYSTEM"}
             </Button>
 
             {/* Footer */}
-            <Box pt="2" borderTop="1px solid #E2E8F0">
+            <Box pt="2" borderTop="1px solid var(--ct-ink-200)">
               <Text
                 fontSize="11px"
-                color="#94A3B8"
+                color="var(--ct-ink-400)"
                 textAlign="center"
                 lineHeight="1.6"
                 fontFamily={SANS}

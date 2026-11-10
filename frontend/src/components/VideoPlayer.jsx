@@ -6,7 +6,7 @@ const MONO = `"JetBrains Mono", monospace`;
 
 function Tag({ color, children, solid = false }) {
   return (
-    <span style={{ background: solid ? color : "#FFF", color: solid ? "#FFF" : color, fontSize: 10, fontFamily: MONO, fontWeight: 600, textTransform: "uppercase", padding: "2px 8px", borderRadius: 4, border: `1px solid ${color}`, whiteSpace: "nowrap" }}>
+    <span style={{ background: solid ? color : "var(--ct-surface)", color: solid ? "#FFF" : color, fontSize: 10, fontFamily: MONO, fontWeight: 600, textTransform: "uppercase", padding: "2px 8px", borderRadius: 4, border: `1px solid ${color}`, whiteSpace: "nowrap" }}>
       {children}
     </span>
   );
@@ -67,31 +67,31 @@ export default function VideoPlayer({ video, onClose }) {
 
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(13,17,23,0.85)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, fontFamily: '"Inter", sans-serif' }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ background: "#FFF", borderRadius: 8, padding: 20, width: "min(700px, 95vw)", maxHeight: "90vh", overflow: "auto" }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: "var(--ct-surface)", borderRadius: 8, padding: 20, width: "min(700px, 95vw)", maxHeight: "90vh", overflow: "auto" }}>
         
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
           <div style={{ minWidth: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
               {(type !== "OK" || skipped.length > 0) && (
-                <Tag color={type !== "OK" ? ANOMALY_STYLE[type].color : "#DC2626"}>
+                <Tag color={type !== "OK" ? ANOMALY_STYLE[type].color : "var(--ct-red)"}>
                   {video.is_buffer ? "ANOMALI" : type === "SHORT" ? "SHORT" : "ANOMALI"}
                 </Tag>
               )}
-              {skipped.length > 0 && <Tag color="#CA8A04">SKIPPED</Tag>}
-              {video.is_genesis && <Tag color="#9333EA">GENESIS</Tag>}
-              {video.is_buffer && <Tag color={video.pending ? "#F58025" : "#DC2626"} solid>{video.pending ? "BUFFER · WAIT" : "BUFFER · ORPHAN"}</Tag>}
-              {!video.is_buffer && video.is_buffered && <Tag color="#0891B2">LATE</Tag>}
-              {showLabel && <Tag color="#64748B">{label}</Tag>}
-              <span style={{ fontSize: 13, fontWeight: 700, color: "#231F20", fontFamily: MONO, wordBreak: "break-all" }}>{video.filename}</span>
+              {skipped.length > 0 && <Tag color="var(--ct-yellow)">SKIPPED</Tag>}
+              {video.is_genesis && <Tag color="var(--ct-purple)">GENESIS</Tag>}
+              {video.is_buffer && <Tag color={video.pending ? "var(--ct-orange-strong)" : "var(--ct-red)"} solid>{video.pending ? "BUFFER · WAIT" : "BUFFER · ORPHAN"}</Tag>}
+              {!video.is_buffer && video.is_buffered && <Tag color="var(--ct-cyan)">LATE</Tag>}
+              {showLabel && <Tag color="var(--ct-ink-500)">{label}</Tag>}
+              <span style={{ fontSize: 13, fontWeight: 700, color: "var(--ct-black)", fontFamily: MONO, wordBreak: "break-all" }}>{video.filename}</span>
             </div>
-            <div style={{ fontSize: 11, color: "#64748B", fontFamily: MONO }}>
+            <div style={{ fontSize: 11, color: "var(--ct-ink-500)", fontFamily: MONO }}>
               L{video.line} ST{video.station_id} &nbsp;·&nbsp;
-              CT: <strong style={{ color: "#231F20" }}>{video.cycle_time_sec != null ? `${Number(video.cycle_time_sec).toFixed(2)}s` : "—"}</strong> &nbsp;·&nbsp;
+              CT: <strong style={{ color: "var(--ct-black)" }}>{video.cycle_time_sec != null ? `${Number(video.cycle_time_sec).toFixed(2)}s` : "—"}</strong> &nbsp;·&nbsp;
               {video.size_mb != null ? `${Number(video.size_mb).toFixed(1)} MB` : "—"} &nbsp;·&nbsp;
               {tsFormatted}
             </div>
           </div>
-          <button onClick={onClose} style={{ border: "1px solid #E2E8F0", background: "#F4F6F8", borderRadius: 4, width: 28, height: 28, cursor: "pointer", fontSize: 16, color: "#64748B", flexShrink: 0, marginLeft: 8 }}>×</button>
+          <button onClick={onClose} style={{ border: "1px solid var(--ct-ink-200)", background: "var(--ct-canvas)", borderRadius: 4, width: 28, height: 28, cursor: "pointer", fontSize: 16, color: "var(--ct-ink-500)", flexShrink: 0, marginLeft: 8 }}>×</button>
         </div>
 
         {layout && (
@@ -99,7 +99,7 @@ export default function VideoPlayer({ video, onClose }) {
             {["all", ...layout.tiles.map((t) => t.slot)].map((sl) => {
               const on = String(slot) === String(sl);
               return (
-                <button key={sl} onClick={() => setSlot(sl)} style={{ padding: "4px 12px", borderRadius: 4, fontSize: 11, fontWeight: 600, fontFamily: MONO, cursor: "pointer", border: "1px solid #005A9C", background: on ? "#005A9C" : "#E0F2FE", color: on ? "#FFF" : "#005A9C" }}>
+                <button key={sl} onClick={() => setSlot(sl)} style={{ padding: "4px 12px", borderRadius: 4, fontSize: 11, fontWeight: 600, fontFamily: MONO, cursor: "pointer", border: "1px solid var(--ct-blue)", background: on ? "var(--ct-blue)" : "var(--ct-blue-50)", color: on ? "var(--ct-on-accent)" : "var(--ct-blue)" }}>
                   {sl === "all" ? "ALL" : `S${sl}`}
                 </button>
               );
@@ -124,22 +124,22 @@ export default function VideoPlayer({ video, onClose }) {
         </div>
         
         {failed && (
-          <div style={{ marginTop: 10, fontSize: 12, color: "#B91C1C", fontFamily: MONO }}>
+          <div style={{ marginTop: 10, fontSize: 12, color: "var(--ct-red-text)", fontFamily: MONO }}>
             Video tidak bisa diputar. FD L{video.line} ST{video.station_id} mungkin offline, file sudah dihapus, atau format tidak didukung browser.{" "}
-            <a href={streamUrl} target="_blank" rel="noreferrer" style={{ color: "#005A9C", fontWeight: 600 }}>Buka langsung</a>.
+            <a href={streamUrl} target="_blank" rel="noreferrer" style={{ color: "var(--ct-blue)", fontWeight: 600 }}>Buka langsung</a>.
           </div>
         )}
         {video.is_buffer && (
-          <div style={{ marginTop: 10, fontSize: 12, color: "#C2410C", fontFamily: MONO }}>
+          <div style={{ marginTop: 10, fontSize: 12, color: "var(--ct-orange-text)", fontFamily: MONO }}>
             {video.pending ? "Video ini masih di FD dan data cycle-nya menunggu dikirim ke server." : "Video ini ada di FD tetapi tidak tercatat di server maupun antrean kirim."}
           </div>
         )}
         
         <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
-          <a href={downloadUrl} download={video.filename} style={{ padding: "8px 16px", borderRadius: 4, fontSize: 11, fontWeight: 600, fontFamily: MONO, textTransform: "uppercase", background: "#E0F2FE", color: "#005A9C", border: "1px solid #005A9C", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <a href={downloadUrl} download={video.filename} style={{ padding: "8px 16px", borderRadius: 4, fontSize: 11, fontWeight: 600, fontFamily: MONO, textTransform: "uppercase", background: "var(--ct-blue-50)", color: "var(--ct-blue)", border: "1px solid var(--ct-blue)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 6 }}>
             Download Video
           </a>
-          <button onClick={onClose} style={{ padding: "8px 16px", borderRadius: 4, fontSize: 11, fontWeight: 600, fontFamily: MONO, textTransform: "uppercase", background: "#FFF", color: "#64748B", border: "1px solid #E2E8F0", cursor: "pointer" }}>
+          <button onClick={onClose} style={{ padding: "8px 16px", borderRadius: 4, fontSize: 11, fontWeight: 600, fontFamily: MONO, textTransform: "uppercase", background: "var(--ct-surface)", color: "var(--ct-ink-500)", border: "1px solid var(--ct-ink-200)", cursor: "pointer" }}>
             Close
           </button>
         </div>

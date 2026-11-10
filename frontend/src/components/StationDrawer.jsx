@@ -52,7 +52,7 @@ export default function StationDrawer({ open, onClose, title, scrollKey, push, c
         <Box
           position="fixed"
           inset={0}
-          bg="rgba(13,17,23,0.45)"
+          bg="var(--ct-overlay)"
           zIndex={19}
           onClick={onClose}
           aria-hidden="true"
@@ -71,9 +71,9 @@ export default function StationDrawer({ open, onClose, title, scrollKey, push, c
         right={0}
         bottom={0}
         w={push ? DRAWER_W : "min(720px, 100vw)"}
-        bg="#F4F6F8"
-        borderLeft="2px solid #F7941D"
-        boxShadow="-8px 0 24px rgba(35,31,32,0.10)"
+        bg="var(--ct-canvas)"
+        borderLeft="2px solid var(--ct-orange)"
+        boxShadow="var(--ct-shadow-drawer)"
         zIndex={20}
         outline="none"
         style={{ animation: "astra-drawer 220ms cubic-bezier(.2,.8,.2,1) both" }}
@@ -85,13 +85,13 @@ export default function StationDrawer({ open, onClose, title, scrollKey, push, c
           px="21px"
           h="48px"
           flexShrink={0}
-          bg="white"
-          borderBottom="1px solid #E2E8F0"
+          bg="var(--ct-surface)"
+          borderBottom="1px solid var(--ct-ink-200)"
         >
           <Text
             fontSize="12px"
             fontWeight="700"
-            color="#231F20"
+            color="var(--ct-black)"
             fontFamily={MONO}
             textTransform="uppercase"
             letterSpacing="0.06em"
@@ -112,10 +112,10 @@ export default function StationDrawer({ open, onClose, title, scrollKey, push, c
             textTransform="uppercase"
             letterSpacing="0.06em"
             borderRadius="3px"
-            color="#64748B"
+            color="var(--ct-ink-500)"
             flexShrink={0}
-            _hover={{ color: "#C5660A", bg: "#FEF4E5" }}
-            _focusVisible={{ boxShadow: "0 0 0 3px #FCE4C5" }}
+            _hover={{ color: "var(--ct-orange-700)", bg: "var(--ct-orange-50)" }}
+            _focusVisible={{ boxShadow: "0 0 0 3px var(--ct-orange-100)" }}
           >
             Close ✕
           </Button>

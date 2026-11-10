@@ -9,25 +9,25 @@ const MONO = `"JetBrains Mono", "SF Mono", ui-monospace, Consolas, monospace`;
 const SANS = `"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
 
 const P = {
-  blue: "#005A9C",
-  blueHover: "#004880",
-  blue50: "#EDF4FA",
-  blue100: "#C5DAEC",
-  orange: "#F7941D",
-  orangeHover: "#DE7E0A",
-  orange50: "#FEF4E5",
-  orange100: "#FCE4C5",
-  black: "#231F20",
-  ink900: "#0F172A",
-  ink700: "#334155",
-  ink600: "#475569",
-  ink500: "#64748B",
-  ink400: "#94A3B8",
-  ink300: "#CBD5E1",
-  ink200: "#E2E8F0",
-  ink100: "#F1F5F9",
-  ink50: "#F8FAFC",
-  white: "#FFFFFF",
+  blue: "var(--ct-blue)",
+  blueHover: "var(--ct-blue-hover)",
+  blue50: "var(--ct-blue-50)",
+  blue100: "var(--ct-blue-100)",
+  orange: "var(--ct-orange)",
+  orangeHover: "var(--ct-orange-hover)",
+  orange50: "var(--ct-orange-50)",
+  orange100: "var(--ct-orange-100)",
+  black: "var(--ct-black)",
+  ink900: "var(--ct-black)",
+  ink700: "var(--ct-ink-700)",
+  ink600: "var(--ct-ink-600)",
+  ink500: "var(--ct-ink-500)",
+  ink400: "var(--ct-ink-400)",
+  ink300: "var(--ct-ink-300)",
+  ink200: "var(--ct-ink-200)",
+  ink100: "var(--ct-ink-100)",
+  ink50: "var(--ct-ink-50)",
+  white: "var(--ct-surface)",
 };
 
 const SP = { xs: "3px", sm: "5px", md: "8px", lg: "13px", xl: "21px" };
@@ -194,7 +194,7 @@ export default function StationRegister() {
   };
 
   return (
-    <Box minH="100vh" bg={P.ink50} px={{ base: SP.lg, md: SP.xl }} py={SP.xl} fontFamily={SANS}>
+    <Box minH="100vh" bg="var(--ct-canvas)" px={{ base: SP.lg, md: SP.xl }} py={SP.xl} fontFamily={SANS}>
       <Box maxW="1400px" mx="auto">
         
         {/* FORM SECTION */}
@@ -322,7 +322,7 @@ export default function StationRegister() {
                 type="submit"
                 h="32px" px={SP.xl} borderRadius={RADII.md}
                 bg={loading ? P.ink300 : editing ? P.orange : P.blue}
-                color={P.white} fontFamily={MONO} fontSize={FS.tiny} fontWeight="700"
+                color={loading ? P.ink500 : "var(--ct-on-accent)"} fontFamily={MONO} fontSize={FS.tiny} fontWeight="700"
                 textTransform="uppercase" letterSpacing="0.05em"
                 _hover={{ bg: loading ? P.ink300 : editing ? P.orangeHover : P.blueHover }}
                 disabled={loading}

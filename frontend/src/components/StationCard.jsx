@@ -9,17 +9,17 @@ const MONO = `"JetBrains Mono", "SF Mono", ui-monospace, Consolas, monospace`;
 
 /* ── Warna status (palet Astra) ──────────────────────────────────────── */
 const STATE_COLOR = {
-  IDLE: { text: "#64748B", border: "#CBD5E1", dot: "#94A3B8", tint: "rgba(148,163,184,.07)" },
-  RUNNING: { text: "#005A9C", border: "#005A9C", dot: "#005A9C", tint: "rgba(0,90,156,.07)" },
-  TRANSIT: { text: "#C2410C", border: "#F58025", dot: "#F58025", tint: "rgba(245,128,37,.08)" },
-  COMPLETE: { text: "#005A9C", border: "#005A9C", dot: "#005A9C", tint: "rgba(0,90,156,.07)" },
-  TIMEOUT: { text: "#B91C1C", border: "#DC2626", dot: "#DC2626", tint: "rgba(220,38,38,.07)" },
-  FAILED: { text: "#B91C1C", border: "#DC2626", dot: "#DC2626", tint: "rgba(220,38,38,.07)" },
-  DISCARD: { text: "#B91C1C", border: "#DC2626", dot: "#DC2626", tint: "rgba(220,38,38,.07)" },
-  CAMERA_OFFLINE: { text: "#6B21A8", border: "#9333EA", dot: "#9333EA", tint: "rgba(147,51,234,.07)" },
-  OFFLINE: { text: "#94A3B8", border: "#E2E8F0", dot: "#CBD5E1", tint: "rgba(203,213,225,.07)" },
-  GOD_MODE: { text: "#005A9C", border: "#005A9C", dot: "#005A9C", tint: "rgba(0,90,156,.07)" },
-  SAVING_MODE: { text: "#C2410C", border: "#F58025", dot: "#F58025", tint: "rgba(245,128,37,.08)" },
+  IDLE: { text: "var(--ct-ink-500)", border: "var(--ct-ink-300)", dot: "var(--ct-ink-400)", tint: "rgba(var(--ct-slate-rgb),.07)" },
+  RUNNING: { text: "var(--ct-blue)", border: "var(--ct-blue)", dot: "var(--ct-blue)", tint: "rgba(var(--ct-blue-rgb),.07)" },
+  TRANSIT: { text: "var(--ct-orange-text)", border: "var(--ct-orange-strong)", dot: "var(--ct-orange-strong)", tint: "rgba(var(--ct-orange-rgb),.08)" },
+  COMPLETE: { text: "var(--ct-blue)", border: "var(--ct-blue)", dot: "var(--ct-blue)", tint: "rgba(var(--ct-blue-rgb),.07)" },
+  TIMEOUT: { text: "var(--ct-red-text)", border: "var(--ct-red)", dot: "var(--ct-red)", tint: "rgba(var(--ct-red-rgb),.07)" },
+  FAILED: { text: "var(--ct-red-text)", border: "var(--ct-red)", dot: "var(--ct-red)", tint: "rgba(var(--ct-red-rgb),.07)" },
+  DISCARD: { text: "var(--ct-red-text)", border: "var(--ct-red)", dot: "var(--ct-red)", tint: "rgba(var(--ct-red-rgb),.07)" },
+  CAMERA_OFFLINE: { text: "var(--ct-purple-text)", border: "var(--ct-purple)", dot: "var(--ct-purple)", tint: "rgba(var(--ct-purple-rgb),.07)" },
+  OFFLINE: { text: "var(--ct-ink-400)", border: "var(--ct-ink-200)", dot: "var(--ct-ink-300)", tint: "rgba(var(--ct-slate-rgb),.07)" },
+  GOD_MODE: { text: "var(--ct-blue)", border: "var(--ct-blue)", dot: "var(--ct-blue)", tint: "rgba(var(--ct-blue-rgb),.07)" },
+  SAVING_MODE: { text: "var(--ct-orange-text)", border: "var(--ct-orange-strong)", dot: "var(--ct-orange-strong)", tint: "rgba(var(--ct-orange-rgb),.08)" },
 };
 
 const STATE_LABEL = {
@@ -37,9 +37,9 @@ const EASE = "cubic-bezier(.2,.8,.2,1)";
 const CARD_KEYFRAMES = `
 @keyframes ctm-rise  { from{opacity:0;transform:translateY(8px) scale(.985)} to{opacity:1;transform:translateY(0) scale(1)} }
 @keyframes ctm-ping  { 0%{transform:scale(1);opacity:.55} 75%,100%{transform:scale(2.6);opacity:0} }
-@keyframes ctm-alert { 0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,0)} 50%{box-shadow:0 0 0 3px rgba(220,38,38,.28)} }
+@keyframes ctm-alert { 0%,100%{box-shadow:0 0 0 0 rgba(var(--ct-red-rgb),0)} 50%{box-shadow:0 0 0 3px rgba(var(--ct-red-rgb),.28)} }
 @keyframes ctm-sheen { 0%{transform:translateX(-100%)} 100%{transform:translateX(220%)} }
-@keyframes ctm-flash { 0%{background-color:rgba(0,90,156,.16)} 100%{background-color:transparent} }
+@keyframes ctm-flash { 0%{background-color:rgba(var(--ct-blue-rgb),.16)} 100%{background-color:transparent} }
 @keyframes ctm-blink { 0%,100%{opacity:1} 50%{opacity:.35} }
 @keyframes ctm-pop   { from{opacity:0;transform:translateY(-3px)} to{opacity:1;transform:translateY(0)} }
 `;
@@ -85,7 +85,7 @@ function FlashValue({ value, children, ...props }) {
 
 function Label({ children }) {
   return (
-    <Text fontSize="9px" color="#64748B" fontWeight="600" letterSpacing="0.06em" textTransform="uppercase">
+    <Text fontSize="9px" color="var(--ct-ink-500)" fontWeight="600" letterSpacing="0.06em" textTransform="uppercase">
       {children}
     </Text>
   );
@@ -162,11 +162,11 @@ export default function StationCard({ station, heartbeat, selected, onClick }) {
   const timed = Boolean(targetCT && elapsedShown != null);
   const ratio = timed ? elapsedShown / targetCT : 0;
   const showBar = Boolean(targetCT);
-  const barColor = ratio >= 1 ? "#DC2626" : ratio >= 0.85 ? "#F58025" : "#005A9C";
+  const barColor = ratio >= 1 ? "var(--ct-red)" : ratio >= 0.85 ? "var(--ct-orange-strong)" : "var(--ct-blue)";
   const barGradient =
-    ratio >= 1 ? "linear-gradient(90deg,#DC2626,#EF4444)"
-    : ratio >= 0.85 ? "linear-gradient(90deg,#F58025,#FBA94C)"
-    : "linear-gradient(90deg,#005A9C,#2B7BBF)";
+    ratio >= 1 ? "linear-gradient(90deg,var(--ct-red),var(--ct-red-light))"
+    : ratio >= 0.85 ? "linear-gradient(90deg,var(--ct-orange-strong),var(--ct-orange-light))"
+    : "linear-gradient(90deg,var(--ct-blue),var(--ct-blue-light))";
 
   const handleKeyDown = (e) => {
     if (!onClick) return;
@@ -184,10 +184,10 @@ export default function StationCard({ station, heartbeat, selected, onClick }) {
       onClick={onClick}
       position="relative"
       overflow="hidden"
-      bg="white"
-      backgroundImage={`linear-gradient(180deg, ${colors.tint} 0%, rgba(255,255,255,0) 42%)`}
+      bg="var(--ct-surface)"
+      backgroundImage={`linear-gradient(180deg, ${colors.tint} 0%, transparent 42%)`}
       borderWidth="1px"
-      borderColor={selected ? "#005A9C" : "#E2E8F0"}
+      borderColor={selected ? "var(--ct-blue)" : "var(--ct-ink-200)"}
       borderLeftWidth="4px"
       borderLeftColor={colors.border}
       borderRadius="6px"
@@ -196,17 +196,17 @@ export default function StationCard({ station, heartbeat, selected, onClick }) {
       minW="0"
       opacity={liveState === "OFFLINE" ? 0.6 : 1}
       transition={`transform 200ms ${EASE}, box-shadow 200ms ${EASE}, border-color 200ms ease, opacity 300ms ease`}
-      boxShadow={selected ? "0 0 0 1px #005A9C, 0 8px 18px -6px rgba(0,90,156,.25)" : "0 1px 2px rgba(0,0,0,0.03)"}
+      boxShadow={selected ? "0 0 0 1px var(--ct-blue), 0 8px 18px -6px rgba(var(--ct-blue-rgb),.25)" : "var(--ct-shadow-xs)"}
       style={{ animation: `ctm-rise 380ms ${EASE} both` }}
       _hover={{
         transform: "translateY(-2px)",
         boxShadow: selected
-          ? "0 0 0 1px #005A9C, 0 10px 22px -6px rgba(0,90,156,.3)"
-          : "0 8px 18px -6px rgba(35,31,32,.14)",
-        borderColor: selected ? "#005A9C" : "#CBD5E1",
+          ? "0 0 0 1px var(--ct-blue), 0 10px 22px -6px rgba(var(--ct-blue-rgb),.3)"
+          : "var(--ct-shadow-md)",
+        borderColor: selected ? "var(--ct-blue)" : "var(--ct-ink-300)",
       }}
       _active={{ transform: "translateY(0) scale(.995)" }}
-      _focusVisible={{ outline: "2px solid", outlineColor: "#005A9C", outlineOffset: "2px" }}
+      _focusVisible={{ outline: "2px solid", outlineColor: "var(--ct-blue)", outlineOffset: "2px" }}
     >
       {/* Cincin alert berdenyut */}
       {alert && (
@@ -220,10 +220,10 @@ export default function StationCard({ station, heartbeat, selected, onClick }) {
       {/* Header */}
       <Flex justify="space-between" align="flex-start" mb={3} gap={2}>
         <Box minW="0">
-          <Text fontSize="10px" color="#64748B" fontWeight="600" mb={1} letterSpacing="0.05em" textTransform="uppercase">
+          <Text fontSize="10px" color="var(--ct-ink-500)" fontWeight="600" mb={1} letterSpacing="0.05em" textTransform="uppercase">
             {stationLabel}
           </Text>
-          <Text fontSize="14px" fontWeight="700" color="#231F20" lineHeight="1.2" noOfLines={1}>
+          <Text fontSize="14px" fontWeight="700" color="var(--ct-black)" lineHeight="1.2" noOfLines={1}>
             {stationName}
           </Text>
         </Box>
@@ -232,7 +232,7 @@ export default function StationCard({ station, heartbeat, selected, onClick }) {
         <Flex
           key={liveState}
           align="center" gap={1.5} px={2} py={1} flexShrink={0}
-          bg="white" borderRadius="full" border="1px solid" borderColor={colors.border}
+          bg="var(--ct-surface)" borderRadius="full" border="1px solid" borderColor={colors.border}
           style={{ animation: "ctm-pop 260ms ease-out" }}
         >
           <Box position="relative" w="6px" h="6px">
@@ -257,7 +257,7 @@ export default function StationCard({ station, heartbeat, selected, onClick }) {
           <Label>Last CT</Label>
           <FlashValue
             value={lastCT} fontSize="17px" fontWeight="700" fontFamily={MONO} lineHeight="1.1"
-            color={isOverTakt ? "#DC2626" : isShort ? "#F58025" : "#231F20"}
+            color={isOverTakt ? "var(--ct-red)" : isShort ? "var(--ct-orange-strong)" : "var(--ct-black)"}
           >
             {fmt(lastCT)}
           </FlashValue>
@@ -265,14 +265,14 @@ export default function StationCard({ station, heartbeat, selected, onClick }) {
 
         <VStack align="start" gap={0.5}>
           <Label>Avg Today</Label>
-          <FlashValue value={station?.avg_ct_today} fontSize="15px" fontWeight="600" fontFamily={MONO} lineHeight="1.15" color="#475569">
+          <FlashValue value={station?.avg_ct_today} fontSize="15px" fontWeight="600" fontFamily={MONO} lineHeight="1.15" color="var(--ct-ink-600)">
             {fmt(station?.avg_ct_today)}
           </FlashValue>
         </VStack>
 
         <VStack align="start" gap={0.5}>
           <Label>Cycles</Label>
-          <FlashValue value={station?.cycles_today ?? 0} fontSize="15px" fontWeight="600" fontFamily={MONO} lineHeight="1.15" color="#475569">
+          <FlashValue value={station?.cycles_today ?? 0} fontSize="15px" fontWeight="600" fontFamily={MONO} lineHeight="1.15" color="var(--ct-ink-600)">
             {station?.cycles_today ?? 0}
           </FlashValue>
         </VStack>
@@ -284,13 +284,13 @@ export default function StationCard({ station, heartbeat, selected, onClick }) {
           <Flex justify="space-between" align="center" mb={1.5}>
             <Label>Elapsed vs Target</Label>
             <Text
-              fontSize="10px" color={ratio >= 1 ? "#DC2626" : "#475569"}
+              fontSize="10px" color={ratio >= 1 ? "var(--ct-red)" : "var(--ct-ink-600)"}
               fontWeight={ratio >= 1 ? "700" : "600"} fontFamily={MONO} style={TABULAR}
             >
               {`${fmt(elapsedShown)} / ${fmt(targetCT)}`}
             </Text>
           </Flex>
-          <Box bg="#EEF2F6" borderRadius="full" h="6px" overflow="hidden" boxShadow="inset 0 1px 1px rgba(0,0,0,.05)">
+          <Box bg="var(--ct-ink-100)" borderRadius="full" h="6px" overflow="hidden" boxShadow="inset 0 1px 1px rgba(0,0,0,.05)">
             <Box
               position="relative" overflow="hidden" h="100%" borderRadius="full"
               width={`${Math.min(ratio * 100, 100)}%`}
@@ -313,7 +313,7 @@ export default function StationCard({ station, heartbeat, selected, onClick }) {
       )}
 
       {/* Actions */}
-      <Flex justify="space-between" align="center" pt={2} borderTop="1px solid #F1F5F9">
+      <Flex justify="space-between" align="center" pt={2} borderTop="1px solid var(--ct-ink-100)">
         <Button
           h="26px" px="10px" fontSize="10px" fontWeight="700"
           variant="outline" borderColor={colors.border} color={colors.text}
@@ -333,20 +333,20 @@ export default function StationCard({ station, heartbeat, selected, onClick }) {
 
         <Button
           h="26px" px="10px" fontSize="10px" fontWeight="700" fontFamily={MONO}
-          variant="outline" borderColor="#E2E8F0" color="#475569"
+          variant="outline" borderColor="var(--ct-ink-200)" color="var(--ct-ink-600)"
           borderRadius="full"
           transition={`background-color 150ms, border-color 150ms, transform 150ms ${EASE}`}
-          _hover={{ borderColor: "#CBD5E1", bg: "#F8FAFC", transform: "translateY(-1px)" }}
+          _hover={{ borderColor: "var(--ct-ink-300)", bg: "var(--ct-ink-50)", transform: "translateY(-1px)" }}
           _active={{ transform: "scale(.97)" }}
           disabled={liveState === "OFFLINE" || liveState === "SAVING_MODE"}
           onClick={(e) => { e.stopPropagation(); setLiveOpen(true); }} onKeyDown={(e) => e.stopPropagation()}
         >
-          <Box as="span" color="#DC2626" mr={1.5} style={{ animation: "ctm-blink 1.4s ease-in-out infinite" }}>●</Box> LIVE
+          <Box as="span" color="var(--ct-red)" mr={1.5} style={{ animation: "ctm-blink 1.4s ease-in-out infinite" }}>●</Box> LIVE
         </Button>
       </Flex>
 
       {modeError && (
-        <Text fontSize="10px" color="#DC2626" mt={2} fontFamily={MONO} style={{ animation: "ctm-pop 240ms ease-out" }}>
+        <Text fontSize="10px" color="var(--ct-red)" mt={2} fontFamily={MONO} style={{ animation: "ctm-pop 240ms ease-out" }}>
           {modeError}
         </Text>
       )}

@@ -28,19 +28,19 @@ export default function StationTimeline({ station, heartbeat }) {
 
     return (
         <Box
-            bg="white"
+            bg="var(--ct-surface)"
             borderWidth="1px"
-            borderColor="gray.200"
+            borderColor="var(--ct-ink-200)"
             borderRadius="8px"
             mt="13px"
             px="21px"
             py="13px"
         >
             <Flex justify="space-between" align="baseline" mb="8px">
-                <Text fontSize="13px" fontWeight="600" color="gray.800">
+                <Text fontSize="13px" fontWeight="600" color="var(--ct-black)">
                     Time Line Cycle
                 </Text>
-                <Text fontSize="11px" color="gray.500">
+                <Text fontSize="11px" color="var(--ct-ink-500)">
                     L{station.line} ST{station.station_id} · {liveState}
                     {elapsed != null ? ` · ${elapsed.toFixed(1)}s` : ""}
                 </Text>
@@ -62,20 +62,20 @@ export default function StationTimeline({ station, heartbeat }) {
                 if (!setpoint) return null;
 
                 const ratio = idle != null ? Math.min(idle / setpoint, 1) : 0;
-                const color = ratio >= 1 ? "red.500" : ratio >= 0.7 ? "orange.400" : "green.500";
+                const color = ratio >= 1 ? "var(--ct-red)" : ratio >= 0.7 ? "var(--ct-orange)" : "var(--ct-green)";
 
                 return (
                     <Box mt="8px">
                         <Flex justify="space-between" mb="4px">
-                            <Text fontSize="11px" color="gray.500">ROI timeout</Text>
-                            <Text fontSize="11px" color={ratio >= 0.7 ? "red.500" : "gray.500"}
+                            <Text fontSize="11px" color="var(--ct-ink-500)">ROI timeout</Text>
+                            <Text fontSize="11px" color={ratio >= 0.7 ? "var(--ct-red)" : "var(--ct-ink-500)"}
                                 style={{ fontVariantNumeric: "tabular-nums" }}>
                                 {idle != null
                                     ? `${idle.toFixed(0)}s / ${setpoint.toFixed(0)}s · sisa ${Math.max(setpoint - idle, 0).toFixed(0)}s`
                                     : `setpoint ${setpoint.toFixed(0)}s`}
                             </Text>
                         </Flex>
-                        <Box bg="gray.100" borderRadius="full" h="6px" overflow="hidden">
+                        <Box bg="var(--ct-ink-100)" borderRadius="full" h="6px" overflow="hidden">
                             <Box h="100%" borderRadius="full" bg={color}
                                 width={`${ratio * 100}%`}
                                 transition="width 0.25s linear, background-color 0.3s ease" />
