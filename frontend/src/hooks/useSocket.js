@@ -47,16 +47,6 @@ export function getRowUi(row) {
   if (t === "OK" && hasExpected(row)) return EXPECTED_UI;
   return TYPE_UI[t];
 }
-/* ------------------------------------------------------------------ *
- * Satu koneksi socket untuk seluruh aplikasi (singleton).
- *
- * Sebelumnya: setiap komponen yang memanggil useSocket() membuka socket
- * sendiri, dan tidak ada cleanup saat komponen ditutup, sehingga socket,
- * timer, dan listener menumpuk selama dashboard terbuka (kebocoran memori).
- * Sekarang: socket dibuat saat pemakai pertama muncul dan ditutup saat
- * pemakai terakhir hilang. Jumlah pemanggil useSocket() tidak lagi
- * menambah koneksi.
- * ------------------------------------------------------------------ */
 
 const DEBUG = false;            // true untuk log diagnosis offline/disconnect
 const HB_FLUSH_MS = 500;
@@ -89,7 +79,23 @@ function sameRows(a, b) {
   }
   return true;
 }
-
+// buang heartbeat/fdOnline milik line di luar daftar langganan
+function pruneToLines(lines) {
+  const keep = new Set(lines.map(String));
+  const pick = (obj) => {
+    const out = {};
+    let changed = false;
+    for (const k in obj) {
+      if (keep.has(k.split("-")[0])) out[k] = obj[k];
+      else changed = true;
+    }
+    return changed ? out : obj;     // referensi lama dipertahankan kalau tidak ada yang dibuang
+  };
+  const heartbeats = pick(state.heartbeats);
+  const fdOnline = pick(state.fdOnline);
+  if (heartbeats !== state.heartbeats || fdOnline !== state.fdOnline) patch({ heartbeats, fdOnline });
+  for (const k in hbBuffer) if (!keep.has(k.split("-")[0])) delete hbBuffer[k];
+}
 // kirim daftar line yang dipantau ke server (gabungan semua pemakai); kosong = semua line
 function syncLines() {
   if (!socket || !socket.connected) return;
@@ -100,6 +106,7 @@ function syncLines() {
   if (key === sentKey) return;
   sentKey = key;
   socket.emit("subscribe", { lines });
+  if (!all) pruneToLines(lines);
 }
 
 function connect() {
@@ -160,43 +167,56 @@ function connect() {
     patch({ heartbeats: { ...state.heartbeats, ...buf } });
   }, HB_FLUSH_MS);
 }
-
 function disconnect() {
   if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
   if (socket) { socket.removeAllListeners(); socket.disconnect(); socket = null; }
   hbBuffer = {};
   sentKey = "all";
-  patch({ socket: null, connected: false });
+  patch({ socket: null, connected: false, summary: EMPTY, heartbeats: {}, fdOnline: {} });
 }
-
-// fungsi fetch tidak bergantung pada state, cukup didefinisikan sekali
-async function fetchHistory(line, station_id, limit = 100, filters = {}) {
-  const params = new URLSearchParams({ limit, ...filters });
-  const res = await axios.get(`${BASE_URL}/api/station/${line}/${station_id}/history?${params}`);
+// buang undefined/null/"" supaya tidak terkirim sebagai "undefined"/"null"; 0 dan false tetap dikirim
+function buildParams(obj = {}) {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === undefined || v === null || v === "") continue;
+    if (typeof v === "number" && Number.isNaN(v)) continue;
+    p.append(k, String(v));
+  }
+  return p;
+}
+async function fetchHistory(line, station_id, limit = 100, filters = {}, { signal } = {}) {
+  const params = buildParams({ ...filters, limit: filters.limit ?? limit });
+  const res = await axios.get(`${BASE_URL}/api/station/${line}/${station_id}/history?${params}`, { signal });
   return res.data;
 }
-async function fetchHourly(line, station_id, filters = {}) {
-  const params = new URLSearchParams(filters);
-  const res = await axios.get(`${BASE_URL}/api/station/${line}/${station_id}/hourly?${params}`);
+async function fetchHourly(line, station_id, filters = {}, { signal } = {}) {
+  const params = buildParams(filters);
+  const res = await axios.get(`${BASE_URL}/api/station/${line}/${station_id}/hourly?${params}`, { signal });
   return res.data;            // { grain, buckets }
 }
-async function fetchStats(line, station_id, filters = {}) {
-  const params = new URLSearchParams(filters);
-  const res = await axios.get(`${BASE_URL}/api/station/${line}/${station_id}/stats?${params}`);
+async function fetchStats(line, station_id, filters = {}, { signal } = {}) {
+  const params = buildParams(filters);
+  const res = await axios.get(`${BASE_URL}/api/station/${line}/${station_id}/stats?${params}`, { signal });
   return res.data;
 }
 function exportCSV(line, station_id, filters = {}) {
-  const params = new URLSearchParams(filters);
+  const params = buildParams(filters);
   const a = document.createElement("a");
   a.href = `${BASE_URL}/api/station/${line}/${station_id}/export?${params}`;
-  a.click();                  // nama file sudah diatur server lewat Content-Disposition
+  a.click();
 }
+// fungsi fetch kini juga diekspor langsung, tidak perlu lewat hook
+export { fetchHistory, fetchHourly, fetchStats, exportCSV };
+export const isAbort = (e) => axios.isCancel(e) || e?.name === "CanceledError";
+// selector bermodul-level supaya referensinya stabil
+export const selectSummary = (s) => s.summary;
+export const selectHeartbeats = (s) => s.heartbeats;
+export const selectFdOnline = (s) => s.fdOnline;
+export const selectConnected = (s) => s.connected;
+export const selectSocket = (s) => s.socket;
 
-/**
- * useSocket()                 -> pantau semua line (perilaku lama)
- * useSocket({ lines: [1,2] }) -> hanya menerima data line 1 dan 2 dari server (hemat bandwidth & memori)
- */
-export function useSocket({ lines } = {}) {
+// mengatur koneksi (ref-count) dan daftar line; tidak membaca state sama sekali
+function useSocketLifecycle(lines) {
   const token = useRef({}).current;
   const linesKey = lines ? [...lines].map(Number).sort((a, b) => a - b).join(",") : null;
 
@@ -217,7 +237,29 @@ export function useSocket({ lines } = {}) {
     lineWants.set(token, linesKey === null ? null : linesKey === "" ? [] : linesKey.split(",").map(Number));
     syncLines();
   }, [token, linesKey]);
+}
 
+/**
+ * Hook baru: hanya re-render kalau irisan yang dipilih berubah.
+ *   const summary = useSocketState(selectSummary, { lines: [1, 2] });
+ *   const heartbeats = useSocketState(selectHeartbeats, { lines });
+ * Selector harus mengembalikan referensi yang sudah ada di state (jangan membuat objek baru).
+ */
+export function useSocketState(selector, { lines } = {}) {
+  useSocketLifecycle(lines);
+  return useSyncExternalStore(
+    subscribeStore,
+    () => selector(state),
+    () => selector(state)
+  );
+}
+
+/**
+ * Kompatibilitas lama: mengembalikan semuanya, jadi tetap re-render
+ * tiap flush heartbeat. Pindahkan pemakai ke useSocketState secara bertahap.
+ */
+export function useSocket({ lines } = {}) {
+  useSocketLifecycle(lines);
   const s = useSyncExternalStore(subscribeStore, getSnapshot, getSnapshot);
   return {
     summary: s.summary,
