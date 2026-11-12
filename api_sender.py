@@ -170,7 +170,23 @@ class ApiSender:
             "size_mb": round(size_bytes / (1024 ** 2), 2),
             "exists": True,
         }
+    def set_base_url(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self.cycle_url = f"{self.base_url}/cycle"
+        self.heartbeat_url = f"{self.base_url}/heartbeat"
 
+    @staticmethod
+    def _line():
+        from fd_slave_api import get_config
+        line = get_config().get("line")
+        if line:
+            return line
+        try:
+            p = Path(__file__).parent / "config" / "station_identity.json"
+            return json.loads(p.read_text(encoding="utf-8")).get("line")
+        except Exception:
+            return None
+        
     # ── Internal send ─────────────────────────────────────────────────────────
 
     def _send_with_retry(self, result: CycleResult, video_info: dict = None, extra: dict = None):
@@ -178,6 +194,12 @@ class ApiSender:
             if self._line() is not None:
                 break
             time.sleep(2)
+        else:
+            payload = self._build_payload(result, video_info, extra)
+            payload["buffered"] = True
+            payload["buffered_at"] = time.time()
+            self._buffer_insert(payload)
+            return
 
         payload = self._build_payload(result, video_info, extra)
 
@@ -205,7 +227,7 @@ class ApiSender:
             )
 
         for attempt in range(1, MAX_RETRY + 1):
-            ok, status = self._post_json(self.cycle_url, payload)
+            ok, status, body = self._post_json(self.cycle_url, payload)
 
             if ok:
                 logger.info(
@@ -214,13 +236,19 @@ class ApiSender:
                 )
                 return
 
-            # 4xx = fatal (route/schema/station_id salah) → jangan retry, jangan buffer
             if status is not None and 400 <= status < 500 and status not in RETRYABLE_STATUS:
-                logger.error(
-                    f"[ApiSender] FATAL HTTP {status} — payload DIBUANG "
-                    f"(bukan retryable). Cek station_id={result.station_id} "
-                    f"di tabel stations, dan route {self.cycle_url}"
-                )
+                if status == 400 and body.get("code") == "FUTURE_TS":
+                    payload["buffered"] = True
+                    payload["buffered_at"] = time.time()
+                    self._buffer_insert(payload)          # tunggu jam dikoreksi
+                    return
+                logger.error(f"[ApiSender] HTTP {status} -> dead")
+                with self._lock:
+                    with sqlite3.connect(self._buffer_db) as conn:
+                        conn.execute(
+                            "INSERT INTO dead (payload, reason, created_at) VALUES (?, ?, ?)",
+                            (json.dumps(payload), f"HTTP {status}", time.time()),
+                        )
                 return
             # Retryable (5xx / 408 / 429 / network error)
             delay = RETRY_DELAY_BASE ** attempt
@@ -236,26 +264,27 @@ class ApiSender:
         payload["buffered_at"] = time.time()      # jam FD saat masuk buffer
         self._buffer_insert(payload)
 
-    def _post_json(self, url: str, payload: dict) -> tuple[bool, Optional[int]]:
-        """HTTP POST JSON. Return (success, status_code|None)."""
+    def _post_json(self, url, payload):
+        """Return (success, status|None, body_dict)."""
         try:
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
-                url,
-                data=data,
-                headers={
-                    "Content-Type": "application/json",
-                    "Content-Length": str(len(data)),
-                },
+                url, data=data,
+                headers={"Content-Type": "application/json",
+                        "Content-Length": str(len(data))},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return resp.status in (200, 201, 204), resp.status
+                return resp.status in (200, 201, 204), resp.status, {}
         except urllib.error.HTTPError as e:
-            return False, e.code
+            try:
+                body = json.loads(e.read().decode("utf-8", "ignore"))
+            except Exception:
+                body = {}
+            return False, e.code, body
         except Exception as e:
             logger.debug(f"[ApiSender] POST {url} error: {e}")
-            return False, None
+            return False, None, {}
 
     @staticmethod
     def _build_payload(result, video_info, extra=None):
@@ -310,7 +339,14 @@ class ApiSender:
                     created_at REAL    NOT NULL
                 )
             """)
-
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dead (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payload    TEXT    NOT NULL,
+                    reason     TEXT,
+                    created_at REAL    NOT NULL
+                )
+            """)
     def _buffer_insert(self, payload: dict):
         with self._lock:
             with sqlite3.connect(self._buffer_db) as conn:
@@ -329,50 +365,70 @@ class ApiSender:
             time.sleep(FLUSH_INTERVAL)
             self._flush_buffer()
 
-    def _flush_buffer(self):
+    def _buffer_kill(self, row_id: int, payload_str: str, reason: str):
+        """Pindahkan ke tabel dead (bisa dipulihkan), bukan hapus."""
         with self._lock:
-            try:
-                with sqlite3.connect(self._buffer_db) as conn:
-                    rows = conn.execute(
-                        "SELECT id, payload FROM pending ORDER BY id LIMIT ?",
-                        (FLUSH_BATCH,),
-                    ).fetchall()
-            except Exception as e:
-                logger.error(f"[ApiSender] Buffer read error: {e}")
+            with sqlite3.connect(self._buffer_db) as conn:
+                conn.execute(
+                    "INSERT INTO dead (payload, reason, created_at) VALUES (?, ?, ?)",
+                    (payload_str, reason, time.time()),
+                )
+                conn.execute("DELETE FROM pending WHERE id = ?", (row_id,))
+
+    def _flush_buffer(self):
+        last_id = 0
+        while True:
+            with self._lock:
+                try:
+                    with sqlite3.connect(self._buffer_db) as conn:
+                        rows = conn.execute(
+                            "SELECT id, payload FROM pending WHERE id > ? ORDER BY id LIMIT ?",
+                            (last_id, FLUSH_BATCH),
+                        ).fetchall()
+                except Exception as e:
+                    logger.error(f"[ApiSender] Buffer read error: {e}")
+                    return
+            if not rows:
                 return
 
-        if not rows:
-            return
+            for row_id, payload_str in rows:
+                last_id = row_id
+                try:
+                    payload = json.loads(payload_str)
+                except Exception as e:
+                    logger.error(f"[ApiSender] Payload rusak id={row_id}: {e}")
+                    self._buffer_kill(row_id, payload_str, f"json rusak: {e}")
+                    continue
 
-        logger.info(f"[ApiSender] Flush buffer: {len(rows)} record pending...")
+                # isi identitas yang kosong saat payload dibuffer
+                if payload.get("line") is None:
+                    line = self._line()
+                    if line is None:
+                        logger.warning("[ApiSender] Identitas line belum ada, flush ditunda")
+                        return
+                    payload["line"] = line
+                    if isinstance(payload.get("video"), dict):
+                        pass  # video tidak membawa line, tidak perlu diubah
 
-        for row_id, payload_str in rows:
-            try:
-                payload = json.loads(payload_str)
-            except Exception as e:
-                logger.error(f"[ApiSender] Payload rusak id={row_id}: {e} — dihapus")
-                self._buffer_delete(row_id)
-                continue
-            payload["synced_at"] = time.time()        # jam FD saat dikirim ulang
-            ok, status = self._post_json(self.cycle_url, payload)
+                payload["synced_at"] = time.time()
+                ok, status, body = self._post_json(self.cycle_url, payload)
 
-            if ok:
-                self._buffer_delete(row_id)
-                logger.info(f"[ApiSender] Buffer flush OK: id={row_id}")
-                continue
+                if ok:
+                    self._buffer_delete(row_id)
+                    logger.info(f"[ApiSender] Buffer flush OK: id={row_id}")
+                    continue
 
-            # 4xx = poison pill → hapus agar tidak memblok queue
-            if status is not None and 400 <= status < 500 and status not in RETRYABLE_STATUS:
-                logger.error(
-                    f"[ApiSender] Buffer drop id={row_id} (HTTP {status}) — "
-                    f"payload ini tidak akan pernah berhasil"
+                if status is not None and 400 <= status < 500 and status not in RETRYABLE_STATUS:
+                    # 400 FUTURE_TS: jam FD maju, bisa berhasil nanti -> tahan, jangan buang
+                    if status == 400 and body.get("code") == "FUTURE_TS":
+                        logger.warning(f"[ApiSender] id={row_id} ditahan: end_timestamp > jam server")
+                        continue
+                    logger.error(f"[ApiSender] Buffer id={row_id} ditolak HTTP {status} -> dead")
+                    self._buffer_kill(row_id, payload_str, f"HTTP {status}")
+                    continue
+
+                logger.warning(
+                    f"[ApiSender] Server belum pulih (status={status}), "
+                    f"id={row_id} tetap di buffer"
                 )
-                self._buffer_delete(row_id)
-                continue
-
-            # 5xx / timeout → server masih down, berhenti dulu (biar batch berikutnya)
-            logger.warning(
-                f"[ApiSender] Buffer tetap disimpan id={row_id} (status={status}) "
-                f"— menunggu server pulih"
-            )
-            break
+                return                                # server masih down: berhenti, coba 30 dtk lagi

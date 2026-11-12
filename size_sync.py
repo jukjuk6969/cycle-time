@@ -33,7 +33,7 @@ NOT_FOUND_RETRY_SEC = 1800  # file yang belum ada barisnya: coba lagi tiap 30 me
 _run_lock = threading.Lock()
 
 SERVER_CFG_PATH = BASE / "config" / "server_config.json"
-BUFFER_MAX_AGE_SEC = 86400 * 2   # batas buffer: 48 jam
+BUFFER_MAX_AGE_SEC = 86400 * 3   # batas buffer: 48 jam
 def default_server() -> str:
     """Baca IP:port master terakhir yang dipakai main.py."""
     try:

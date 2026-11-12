@@ -43,7 +43,8 @@ class LogicCycleEngine:
         self._lock = threading.RLock()
         self._tester = SequenceTester()
         self.cfg = None
-
+        self._latest = {}          # source -> (waktu, deteksi terakhir)
+        self.STALE = 1.0           # detik; deteksi source yang lebih tua dari ini diabaikan
         self.on_cycle_start: Optional[Callable] = None
         self.on_cycle_complete: Optional[Callable] = None
         self.on_cycle_rejected: Optional[Callable] = None
@@ -99,12 +100,11 @@ class LogicCycleEngine:
         self._fire(events)
         return changed
 
-    def adapt(self, frame_w: int, frame_h: int, mirror: bool) -> list:
-        """Sesuaikan koordinat ROI ke resolusi/mirror kamera aktif. Return catatan perubahan."""
+    def adapt(self, slot: int, frame_w: int, frame_h: int, mirror: bool) -> list:
         with self._lock:
             if self.cfg is None:
                 return []
-            notes = adapt_to_frame(self.cfg, frame_w, frame_h, bool(mirror))
+            notes = adapt_to_frame(self.cfg, slot, frame_w, frame_h, bool(mirror))
             if notes:
                 self.set_config(self.cfg)
             return notes
@@ -118,15 +118,20 @@ class LogicCycleEngine:
         return self._tester.error
 
     # ── inti ──────────────────────────────────────────────────────────────
-    def update(self, dets: list, t: Optional[float] = None):
+    def update(self, dets: list, t: Optional[float] = None, source: int = 1):
         t = time.time() if t is None else t
         events = []
         with self._lock:
             tester = self._tester
             if not self.ready():
                 return
-            tester.update(dets, t)
-
+            # simpan deteksi terbaru source ini, gabung dengan source lain yang masih segar
+            self._latest[source] = (t, [tuple(d[:6]) + (source,) for d in dets])
+            merged = []
+            for s, (ts, ds) in self._latest.items():
+                if s == source or t - ts <= self.STALE:
+                    merged += ds
+            tester.update(merged, t)
             if any(names for _, names in tester.assign):
                 self._last_hit = t
 

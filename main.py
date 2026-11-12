@@ -31,7 +31,10 @@ import size_sync
 import csv
 import fd_auth
 from logic_editor import load_logic_xml, validate as validate_logic, LogicEditorPanel
-from datetime import datetime, timedelta, timedelta
+from datetime import datetime, timedelta
+import urllib.error
+from source_hub import SourceHub
+from tile_view import compose, canvas_size, fixed_cell, grid_for, layout_meta, rec_cell
 
 try:
 
@@ -45,7 +48,6 @@ from video_recorder import VideoRecorder
 from camera_manager import CameraManager
 from api_sender import ApiSender
 from storage_manager import StorageManager, VIDEOS_DIR
-from logic_editor import load_logic_xml, validate as validate_logic
 from logic_cycle_engine import LogicCycleEngine
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -476,8 +478,6 @@ class CycleReporter:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._path = os.path.join(output_dir, f"cycle_report_{ts}.csv")
         self._lock = threading.Lock()
-        import csv
-
         with open(self._path, "w", encoding="utf-8", newline="") as f:
             csv.writer(f).writerow(
                 [
@@ -509,20 +509,25 @@ class CycleReporter:
 # ═══════════════════════════════════════════════════════════════════════════════
 class YOLOInference:
     def __init__(self):
-        self._model = None
+        self._models = {}            # path -> YOLO (dipakai bersama bila path sama)
+        self._slot_model = {}        # slot -> path ("" = tanpa model)
+        self._failed = set()         # path yang gagal dimuat
+        self._loading = set()
+        self._load_lock = threading.Lock()
+        self.on_models_changed = None
         self._conf = 0.25
         self._imgsz = 640
-        self._input_q = queue.Queue(maxsize=2)
         self._out_lock = threading.Lock()
-        self._drawn = None
-        self._raw = None
-        self._dets = []
         self._running = False
         self._thread = None
         self.enabled = False
         self._tracked_classes: set = set()
         self._engine: "LogicCycleEngine | None" = None
         self.on_cycle_aborted = None   # callback(reason: str)
+        self._pending = {}
+        self._pend_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._out = {}              # slot -> (drawn, raw, dets)
 
     # ── engine logika ──
     def set_engine(self, engine):
@@ -552,25 +557,11 @@ class YOLOInference:
     def get_cycle_count(self) -> int:
         return self._engine.cycle_count if self._engine else 0
 
-    # ── model ──
-    def load(self, path: str) -> bool:
-        if not YOLO_AVAILABLE:
-            return False
-        try:
-            self._model = _YOLO(path)
-            return True
-        except Exception as e:
-            logger.error(f"[YOLO] load error: {e}")
-            return False
-
     def set_conf(self, v: float):
         self._conf = max(0.01, min(1.0, v))
 
     def set_tracked_classes(self, classes: set):
         self._tracked_classes = set(classes)
-
-    def get_class_names(self) -> dict:
-        return dict(self._model.names) if self._model else {}
 
     def start(self):
         if self._running:
@@ -581,45 +572,112 @@ class YOLOInference:
 
     def stop(self):
         self._running = False
-        try:
-            self._input_q.put_nowait(None)
-        except queue.Full:
-            pass
+        self._wake.set()
         if self._thread:
             self._thread.join(timeout=2)
 
-    def push(self, frame):
-        if not self.enabled or self._model is None:
-            return
-        try:
-            self._input_q.put_nowait(frame)
-        except queue.Full:
-            pass
+    @staticmethod
+    def _names_of(m) -> dict:
+        n = m.names
+        return dict(n) if isinstance(n, dict) else dict(enumerate(n))
 
-    def get_result(self):
-        with self._out_lock:
-            return self._drawn, self._raw, list(self._dets)
+    def assign(self, mapping: dict, retry: bool = False):
+        """mapping {slot: path}. Model baru dimuat di background, yang tak terpakai dilepas."""
+        clean = {int(s): (p or "").strip() for s, p in mapping.items()}
+        need = {p for p in clean.values() if p}
+        with self._load_lock:
+            self._slot_model = clean
+            if retry:
+                self._failed.clear()
+            self._failed &= need
+            for p in [p for p in self._models if p not in need]:
+                del self._models[p]
+            todo = [p for p in need if p not in self._models
+                    and p not in self._loading and p not in self._failed]
+            self._loading.update(todo)
+        with self._out_lock:                      # slot tanpa model: buang hasil lama
+            for s in [s for s in self._out if not clean.get(s)]:
+                del self._out[s]
+        for p in todo:
+            threading.Thread(target=self._load_bg, args=(p,), daemon=True,
+                             name="yolo-load").start()
+
+    def _load_bg(self, path):
+        model = None
+        try:
+            if not YOLO_AVAILABLE:
+                raise RuntimeError("ultralytics belum terpasang")
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            model = _YOLO(path)
+        except Exception as e:
+            logger.error(f"[YOLO] gagal memuat {path}: {e}")
+        with self._load_lock:
+            self._loading.discard(path)
+            if model is None:
+                self._failed.add(path)
+            elif path in self._slot_model.values():
+                self._models[path] = model
+        if self.on_models_changed:
+            try:
+                self.on_models_changed()
+            except Exception as e:
+                logger.error(f"[YOLO] on_models_changed error: {e}", exc_info=True)
+
+    def slot_state(self, slot) -> str:
+        """none | loading | failed | ready"""
+        p = self._slot_model.get(slot, "")
+        if not p:
+            return "none"
+        if p in self._models:
+            return "ready"
+        return "failed" if p in self._failed else "loading"
+
+    def any_ready(self) -> bool:
+        return bool(self._models)
+
+    def summary(self) -> list:
+        return [(s, os.path.basename(p) if p else "", self.slot_state(s))
+                for s, p in sorted(self._slot_model.items())]
+
+    def get_class_names(self, slot=None) -> dict:
+        if slot is not None:
+            m = self._models.get(self._slot_model.get(slot, ""))
+            return self._names_of(m) if m else {}
+        labels = sorted({str(n) for m in list(self._models.values())
+                         for n in self._names_of(m).values()})
+        return dict(enumerate(labels))
+
+    def push(self, frame, slot=1):
+        if not self.enabled or self.slot_state(slot) != "ready":
+            return                                  # tanpa model: tidak ada kerja CPU
+        with self._pend_lock:
+            self._pending[slot] = frame
+        self._wake.set()
 
     def _loop(self):
         while self._running:
-            item = self._input_q.get()
-            if item is None:
-                break
-            raw = item
-            try:
-                results = self._model.predict(
-                    source=raw, conf=self._conf, imgsz=self._imgsz, verbose=False,
-                )
-                drawn, dets = self._draw_and_track(raw.copy(), results)
-            except Exception as e:
-                logger.error(f"[YOLO] infer error: {e}", exc_info=True)
-                drawn, dets = raw.copy(), []
-            with self._out_lock:
-                self._drawn = drawn
-                self._raw = raw
-                self._dets = dets
+            self._wake.wait(timeout=0.5)
+            self._wake.clear()
+            with self._pend_lock:
+                batch, self._pending = self._pending, {}
+            for slot, raw in sorted(batch.items()):
+                if not self._running:
+                    break
+                model = self._models.get(self._slot_model.get(slot, ""))
+                if model is None:
+                    continue
+                try:
+                    results = model.predict(
+                        source=raw, conf=self._conf, imgsz=self._imgsz, verbose=False)
+                    drawn, dets = self._draw_and_track(raw.copy(), results, slot)
+                except Exception as e:
+                    logger.error(f"[YOLO] infer error: {e}", exc_info=True)
+                    drawn, dets = raw.copy(), []
+                with self._out_lock:
+                    self._out[slot] = (drawn, raw, dets)
 
-    def _draw_and_track(self, frame, results):
+    def _draw_and_track(self, frame, results, slot=1):
         palette = [
             (0, 200, 255), (0, 255, 100), (255, 80, 80), (255, 200, 0),
             (180, 0, 255), (0, 180, 180), (255, 140, 0), (100, 255, 0),
@@ -650,16 +708,20 @@ class YOLOInference:
                 boxes.append((x1, y1, x2, y2, label, conf))
         # Selalu dipanggil tiap inferensi (termasuk boxes kosong) agar dwell/grace bisa berakhir
         if self._engine and self.engine_enabled:
-            self._engine.update(boxes)
+            self._engine.update(boxes, source=slot)
         return frame, dets
-
+    def get_result(self, slot=1):
+        with self._out_lock:
+            drawn, raw, dets = self._out.get(slot, (None, None, []))
+            return drawn, raw, list(dets)
 class ROIViewer:
     """Menggambar ROI dari logic_config (hanya-baca) di atas preview RGB."""
     COLORS = {"input": (60, 200, 80), "output": (30, 130, 240),
               "mandatory": (255, 120, 30), "expected": (240, 200, 40)}
 
-    def __init__(self, engine_getter):
+    def __init__(self, engine_getter, slot_getter=lambda: 1):
         self._get = engine_getter
+        self._slot = slot_getter
         self._sx = self._sy = 1.0
 
     def set_scale(self, preview_w, preview_h, frame_w, frame_h):
@@ -667,14 +729,17 @@ class ROIViewer:
             self._sx = preview_w / frame_w
             self._sy = preview_h / frame_h
 
-    def draw_on_frame(self, frame):
+    def draw_on_frame(self, frame, slot=None):
         eng = self._get()
         cfg = eng.cfg if eng else None
         if cfg is None:
             return frame
         status = eng.status()
         seq_no = {r.id: i for i, r in enumerate(cfg.sequence, 1)}
+        slot = self._slot() if slot is None else slot
         for r in cfg.all_rois():
+            if r.source != slot:
+                continue
             x1, y1, x2, y2 = r.rect
             p1 = (int(x1 * self._sx), int(y1 * self._sy))
             p2 = (int(x2 * self._sx), int(y2 * self._sy))
@@ -758,6 +823,23 @@ class CTMonitorApp:
         self.root = root
         self.args = args
         self._logic_path: Path = LOGIC_CONFIG_PATH      # path aktif (bisa diganti lewat file picker)
+        self.hub = SourceHub(self._on_source_frame)
+        fd_slave_api.set_slot_source(self.hub.frame)
+        self._view_slot = 1
+        self._adapted = {}          # slot -> (w, h, mirror) terakhir yang di-adapt
+        self._view_mode = "single"      # single | tile
+        self._tile_n = 2
+        self._tile_scroll = 0        # offset piksel vertikal
+        self._tile_total = 0         # tinggi kanvas penuh
+        self._tile_step = 1          # tinggi satu baris tile (langkah scroll)
+        self._tile_sb_shown = False
+        self._last_n = 0
+        self._rec_slots = []
+        self._rec_cell = (0, 0)
+        self._cell = None            # sel kanvas siklus/stream (resolusi asli, dibatasi REC_CAP)
+        self._comp_run = False
+        self._comp_thread = None
+        self._mode_before_editor = "single"
         try:
             self._logic_config = load_logic_xml(self._logic_path)
             logger.info(
@@ -800,6 +882,7 @@ class CTMonitorApp:
 
         # ── YOLO ───────────────────────────────────────────────────────────
         self.yolo = YOLOInference()
+        self.yolo.on_models_changed = lambda: self.root.after(0, self._on_models_ready)
         self.yolo.set_engine(LogicCycleEngine())
         self._attach_cycle_callbacks()
         self.yolo.on_cycle_aborted = self._on_cycle_aborted
@@ -826,6 +909,7 @@ class CTMonitorApp:
         # ── Settings ───────────────────────────────────────────────────────
         self._settings_path = Path(__file__).parent / "config" / "ct_settings.json"
         self._cfg = load_settings(str(self._settings_path))
+        self._sender = ApiSender(base_url=self.args.endpoint.replace("/api/cycle", "/api"))
         self._storage = StorageManager()
         self._storage.start()
 
@@ -859,6 +943,7 @@ class CTMonitorApp:
         self._var_min_lim  = tk.StringVar(value="—")
         self._var_ok_count = tk.StringVar(value="0")
         self._var_shift = tk.StringVar(value="—")
+        self._var_clock = tk.StringVar(value="—")
         self._shift_key = None          # awal shift aktif; berubah = ganti shift
         self._shift_ok = 0
         self._shift_anom = 0
@@ -889,7 +974,9 @@ class CTMonitorApp:
         self.photo_count_var = tk.StringVar(value="Foto: 0")
         self._photo_count = 0
         self.model_path_var = tk.StringVar(value="")
+        self.model_info_var = tk.StringVar(value="Belum ada source")
         self.conf_var = tk.DoubleVar(value=0.25)
+        self._roi_min_conf = 1.0
         self.det_count_var = tk.StringVar(value="Deteksi: 0")
         self._class_vars: dict[str, tk.BooleanVar] = {}
         self._saved_disabled_classes: set[str] = set()
@@ -906,7 +993,7 @@ class CTMonitorApp:
         self._restore_setup()
         self._init_logic_engine()        
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
-
+        self.mirror_var.trace_add("write", lambda *_: self.running and self._sync_sources())
         # Mulai koneksi server di background
         # Antrean UI untuk thread background (aman dipakai sebelum mainloop)
         self._ui_q: queue.Queue = queue.Queue()
@@ -1007,6 +1094,136 @@ class CTMonitorApp:
                 text=f"Sync ukuran: {r['ok']} OK | {r['not_found']} belum ada di server | {r['failed']} gagal"))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _resync_held_videos(self):
+        if getattr(self, "_resync_busy", False):
+            return
+        if not (self.args.line and self.args.station_no):
+            messagebox.showwarning("Sync Video", "Identitas stasiun belum diketahui.")
+            return
+        if not messagebox.askyesno(
+                "Sync Video Lama",
+                "Kirim ulang cycle + video yang belum tercatat di server?"):
+            return
+        self._resync_busy = True
+        base_url = self.args.endpoint.replace("/api/cycle", "")
+        line, st = int(self.args.line), int(self.args.station_no)
+        self.root_status.config(text="Sync video lama: membaca summary...")
+
+        def say(t):
+            self._ui(lambda: self.root_status.config(text=t))
+
+        def work():
+            res = {"sent": 0, "known": 0, "no_file": 0, "failed": 0}
+            try:
+                # 1) kumpulkan baris summary milik stasiun ini yang videonya masih ada di disk
+                rows = []
+                for p in sorted(VIDEOS_DIR.glob("*/*_summary.csv")):
+                    with open(p, newline="", encoding="utf-8") as fh:
+                        for r in csv.DictReader(fh):
+                            try:
+                                if int(r.get("line") or 0) != line or int(r.get("station_id") or 0) != st:
+                                    continue
+                            except ValueError:
+                                continue
+                            fn = (r.get("video_filename") or "").strip()
+                            if not fn:
+                                continue
+                            path = (self._storage.find_video("anomaly", fn)
+                                    or self._storage.find_video("normal", fn))
+                            if path is None:
+                                res["no_file"] += 1
+                                continue
+                            try:
+                                end_ts = datetime.fromisoformat(r["end_timestamp"]).timestamp()
+                                start_ts = datetime.fromisoformat(r["start_timestamp"]).timestamp()
+                            except (ValueError, KeyError, TypeError):
+                                continue
+                            rows.append((end_ts, start_ts, r, path))
+                if not rows:
+                    say("Sync video lama: tidak ada video untuk dikirim")
+                    return
+
+                # 2) nama video yang sudah ada di server
+                t0 = min(x[0] for x in rows) - 3600
+                t1 = max(x[0] for x in rows) + 3600
+                known, off = set(), 0
+                while True:
+                    q = (f"{base_url}/api/videos?line={line}&station_id={st}"
+                         f"&from={datetime.utcfromtimestamp(t0).isoformat()}Z"
+                         f"&to={datetime.utcfromtimestamp(t1).isoformat()}Z"
+                         f"&limit=1000&offset={off}")
+                    with _urllib.urlopen(q, timeout=10) as resp:
+                        page = json.loads(resp.read())
+                    known.update(v.get("filename") for v in page)
+                    if len(page) < 1000:
+                        break
+                    off += 1000
+
+                todo = [x for x in rows if x[2]["video_filename"] not in known]
+                res["known"] = len(rows) - len(todo)
+
+                # 3) kirim satu per satu, urut waktu
+                todo.sort(key=lambda x: x[0])
+                for i, (end_ts, start_ts, r, path) in enumerate(todo, 1):
+                    atype = (r.get("anomaly_type") or "OK").upper()
+                    skipped = [{"id": "", "description": d.strip()}
+                               for d in (r.get("skipped_expected") or "").split(";") if d.strip()]
+                    is_anom = r.get("is_anomaly") in ("1", "True", "true")
+                    genesis = r.get("is_genesis") in ("1", "True", "true")
+                    size_mb = round(path.stat().st_size / 1024 / 1024, 2)
+                    payload = {
+                        "line": line, "station_id": st,
+                        "cycle_time_sec": float(r["cycle_time_sec"]),
+                        "operator_id": r.get("operator_id") or None,
+                        "start_timestamp": start_ts, "end_timestamp": end_ts,
+                        "is_complete": True,
+                        "anomaly_type": atype,
+                        "label": "GENESIS" if genesis else "",
+                        "is_genesis": genesis,
+                        "is_anomaly": is_anom,
+                        "anomaly_label": r.get("anomaly_label") or "",
+                        "skipped_expected": skipped,
+                        "buffered": True,
+                        "video": {
+                            "filename": path.name, "size_mb": size_mb,
+                            "is_anomaly": is_anom, "anomaly_type": atype,
+                            "label": "GENESIS" if genesis else "",
+                            "is_genesis": genesis,
+                            "recorded_ts": end_ts,
+                        },
+                    }
+                    req = _urllib.Request(
+                        f"{base_url}/api/cycle",
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}, method="POST")
+                    try:
+                        with _urllib.urlopen(req, timeout=8) as resp:
+                            res["sent"] += 1 if resp.status in (200, 201) else 0
+                    except urllib.error.HTTPError as e:
+                        res["failed"] += 1
+                        logger.warning(f"[Resync] {path.name}: HTTP {e.code}")
+                        if e.code == 503:
+                            break
+                    except Exception as e:
+                        res["failed"] += 1
+                        logger.warning(f"[Resync] {path.name}: {e}")
+                        if res["failed"] >= 5 and res["sent"] == 0:
+                            break
+                    if i % 5 == 0:
+                        say(f"Sync video lama: {i}/{len(todo)}")
+                say(f"Sync video lama selesai: {res['sent']} terkirim | "
+                    f"{res['known']} sudah ada | {res['no_file']} file hilang | "
+                    f"{res['failed']} gagal")
+                logger.info(f"[Resync] {res}")
+            except Exception as e:
+                logger.error(f"[Resync] error: {e}", exc_info=True)
+                say(f"Sync video lama gagal: {e}")
+            finally:
+                self._resync_busy = False
+
+        threading.Thread(target=work, daemon=True, name="resync-videos").start()
+
     def _init_server(self):
         # Hanya satu proses init/reconnect pada satu waktu
         if not self._server_lock.acquire(blocking=False):
@@ -1042,6 +1259,7 @@ class CTMonitorApp:
             cfg = {"station_id": st, "line": ln}
         self.args.station = self.args.station_no = cfg["station_id"]
         self.args.line = cfg["line"]
+        self._ui(self._sync_recorder)
         if cfg.get("takt_time"):
             self.args.takt_time = cfg["takt_time"]
         self._ui( lambda: self._var_station.set(str(cfg["station_id"])))
@@ -1096,7 +1314,7 @@ class CTMonitorApp:
             self.args.line       = cfg["line"]
             self.args.takt_time  = cfg["takt_time"]
             save_identity(cfg)
-
+            self._ui(self._sync_recorder)
             self._ui(lambda: self._var_station.set(str(cfg["station_id"])))
             self._ui(lambda: self._var_line.set(cfg.get("line", "—")))
             self._ui(lambda: self._var_name.set(cfg.get("name", "—")))
@@ -1126,8 +1344,7 @@ class CTMonitorApp:
             if cfg.get("min_cycle_sec") is not None:
                 takt._min = float(cfg["min_cycle_sec"])
 
-            if self._sender is None:        # satu instance saja, agar thread flush buffer tidak dobel
-                self._sender = ApiSender(base_url=f"{base_url}/api")
+            self._sender.set_base_url(f"{base_url}/api")
 
             if not self._hb_started:
                 self._hb_started = True
@@ -1456,8 +1673,6 @@ class CTMonitorApp:
         self._var_logic_file.set(new_path.name)
         self._logic_config = cfg
         self._init_logic_engine()
-        if self.running:
-            self.yolo.engine.adapt(self._frame_w, self._frame_h, self.mirror_var.get())
         logger.info(f"[Logic] File XML diganti ke {new_path}")
     def _reload_logic(self):
         try:
@@ -1467,14 +1682,12 @@ class CTMonitorApp:
             return
         self._logic_config = cfg
         self._init_logic_engine()
-        if self.running:
-            self.yolo.engine.adapt(self._frame_w, self._frame_h, self.mirror_var.get())
+
     def _enter_roi_editor(self):
         if self._roi_editor is not None:
             return
         if not self.running:
-            messagebox.showinfo("Edit ROI", "Buka kamera / video dulu, lalu klik Edit ROI.")
-            return
+            self.start_camera()
         # Hentikan logika produksi selama ROI diedit
         self.yolo.engine_enabled = False
         self.yolo.engine.abort_cycle()
@@ -1485,10 +1698,13 @@ class CTMonitorApp:
 
         self._ctrl_canvas.pack_forget()
         self._ctrl_scrollbar.pack_forget()
+        self._mode_before_editor = self._view_mode
+        self._view_mode = "single"
+        self._view_mode_var.set("single")
         panel = LogicEditorPanel(
             self._ctrl_outer, self.preview,
-            get_frame_size=lambda: (self._frame_w, self._frame_h) if self.running else (0, 0),
-            get_class_names=self.yolo.get_class_names,
+            get_frame_size=lambda: self.hub.size(self._view_slot),
+            get_class_names=lambda: self.yolo.get_class_names(self._view_slot),
             get_mirror=lambda: self.mirror_var.get(),
             get_default_conf=lambda: self.conf_var.get(),
             xml_path=self._logic_path,
@@ -1496,18 +1712,25 @@ class CTMonitorApp:
             on_close=lambda: self.root.after(0, self._exit_roi_editor),
             set_status=lambda t: self.root_status.config(text=t),
             get_live=self.yolo.engine.monitor_snapshot,
+            on_select_source=self._on_editor_select_slot,
+            on_sources_changed=self._sync_sources,
+            
         )
         panel.pack(fill="both", expand=True)
         panel.attach()
         self._roi_editor = panel
         self.root_status.config(
             text="Edit ROI — tekan P untuk membekukan preview sebelum menggambar")
-
+    def _on_editor_select_slot(self, slot):
+        self._view_slot = slot
+        self._view_combo.set(f"S{slot}")
     def _exit_roi_editor(self):
         panel = self._roi_editor
         if panel is None:
             return
         self._roi_editor = None
+        self._view_mode_var.set(self._mode_before_editor)
+        self._on_view_mode()
         try:
             panel.detach()
         finally:
@@ -1542,10 +1765,12 @@ class CTMonitorApp:
             self.root_status.config(text="logic_config.xml tidak valid — lihat log")
             return
         self.yolo.engine.set_config(cfg)
+        self._adapted.clear()
+        if self.running:
+            self._sync_sources(retry=True)      # Muat ulang XML = coba lagi model yang gagal
         lowest = max(0.01, int(min(r.conf for r in cfg.all_rois()) * 100) / 100)
-        if lowest < self.conf_var.get():
-            self.conf_var.set(lowest)
-            self._on_conf_change()
+        self._roi_min_conf = lowest
+        self._on_conf_change()
         n = len(cfg.sequence)
         self._var_logic.set(f"{n} sequence ROI | dimuat {datetime.now():%H:%M:%S}")
         logger.info(f"[Logic] Engine aktif: {n} sequence ROI")
@@ -1605,7 +1830,10 @@ class CTMonitorApp:
         )
     def _on_cycle_start(self, ts=None):
         if self._ct_recorder and not self.args.no_record:
-            self._ct_recorder.start_cycle(ts or time.time())
+            slots, sizes = self.hub.slots(), self.hub.sizes()
+            cell = self._cell or rec_cell(sizes, slots)
+            self._ct_recorder.start_cycle(
+                ts or time.time(), layout=layout_meta(slots, cell, sizes=sizes))
         logger.info("[Cycle] START")
 
     def _on_cycle_complete(self, cycle_num, start_ts, end_ts, cycle_time,
@@ -1814,8 +2042,13 @@ class CTMonitorApp:
 
         self._preview_container = tk.Frame(preview_outer, bg="black", width=1, height=1)
         self._preview_container.grid(row=0, column=0, sticky="nsew")
-        self._preview_container.pack_propagate(False)    # label/gambar tidak boleh memaksa container membesar
+        self._preview_container.pack_propagate(False)
         self._preview_container.grid_propagate(False)
+
+        self._tile_sb = ttk.Scrollbar(preview_outer, orient="vertical",
+                                      command=self._on_tile_sbar)
+        self._tile_sb.grid(row=0, column=1, sticky="ns")
+        self._tile_sb.grid_remove()
 
         self.preview = tk.Label(
             self._preview_container,
@@ -1825,7 +2058,10 @@ class CTMonitorApp:
             font=("Arial", 18),
         )
         self.preview.pack(fill="both", expand=True)
-        self.roi_view = ROIViewer(lambda: self.yolo.engine)
+        self.preview.bind("<MouseWheel>", self._on_tile_wheel)
+        self.preview.bind("<Button-4>", self._on_tile_wheel)   # Linux
+        self.preview.bind("<Button-5>", self._on_tile_wheel)
+        self.roi_view = ROIViewer(lambda: self.yolo.engine, lambda: self._view_slot)
 
         # Control panel (scrollable)
         ctrl_outer = tk.Frame(main)
@@ -1956,6 +2192,7 @@ class CTMonitorApp:
         _row("Short (s)", self._var_short_lim) 
         _row("Cycle Count", self._var_cycle, bold=True)
         _row("Takt Time", self._var_takt)
+        _row("Jam", self._var_clock, bold=True)
         _row("Shift", self._var_shift)
         count_row = ttk.Frame(box)
         count_row.pack(fill="x", pady=(6, 2))
@@ -2010,86 +2247,73 @@ class CTMonitorApp:
     # ── Panel: Camera ─────────────────────────────────────────────────────
 
     def _build_panel_camera(self, parent):
-        cam_box = ttk.LabelFrame(parent, text="Camera", padding=8)
-        cam_box.pack(fill="x", pady=(0, 6))
+        box = ttk.LabelFrame(parent, text="Source (maks. 9)", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+        ttk.Label(box, text="Device diatur di Logic Editor (＋ Add Source). "
+                            "Stream server & rekaman siklus selalu tile semua source.",
+                  foreground="#777777", wraplength=260).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
-        ttk.Label(cam_box, text="Sumber").grid(row=0, column=0, sticky="w", pady=2)
-        ttk.Combobox(
-            cam_box,
-            textvariable=self.source_var,
-            values=["Kamera", "Video File"],
-            state="readonly",
-            width=12,
-        ).grid(row=0, column=1, sticky="ew", padx=4)
-        self.source_var.trace_add("write", self._on_source_change)
+        self._view_mode_var = tk.StringVar(value="single")
+        mrow = ttk.Frame(box)
+        mrow.grid(row=1, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(mrow, text="Preview:").pack(side="left")
+        ttk.Radiobutton(mrow, text="1 source", variable=self._view_mode_var, value="single",
+                        command=self._on_view_mode).pack(side="left", padx=(6, 0))
+        ttk.Radiobutton(mrow, text="Tile", variable=self._view_mode_var, value="tile",
+                        command=self._on_view_mode).pack(side="left", padx=(6, 0))
 
-        self.cam_label = ttk.Label(cam_box, text="Pilih Kamera")
-        self.cam_label.grid(row=1, column=0, sticky="w", pady=2)
-        self.cam_combo = ttk.Combobox(
-            cam_box,
-            textvariable=self.camera_name_var,
-            values=list(self._camera_map.keys()),
-            state="readonly",
-            width=18,
-        )
-        self.cam_combo.grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Label(box, text="Source").grid(row=2, column=0, sticky="w", pady=2)
+        self._view_combo = ttk.Combobox(box, state="readonly", width=8, values=[])
+        self._view_combo.grid(row=2, column=1, sticky="w", padx=4)
+        self._view_combo.bind("<<ComboboxSelected>>", self._on_view_pick)
 
-        self.vid_label = ttk.Label(cam_box, text="File Video")
-        self.vid_row = ttk.Frame(cam_box)
-        ttk.Entry(self.vid_row, textvariable=self.video_path_var, width=14).pack(
-            side="left", expand=True, fill="x"
-        )
-        ttk.Button(
-            self.vid_row, text="Browse", command=self._browse_video, width=7
-        ).pack(side="left", padx=(4, 0))
-        self.vid_label.grid(row=2, column=0, sticky="w", pady=2)
-        self.vid_row.grid(row=2, column=1, sticky="ew", padx=4)
-        self.vid_label.grid_remove()
-        self.vid_row.grid_remove()
+        ttk.Label(box, text="Jumlah tile").grid(row=3, column=0, sticky="w", pady=2)
+        self._tile_combo = ttk.Combobox(box, state="disabled", width=8, values=[])
+        self._tile_combo.grid(row=3, column=1, sticky="w", padx=4)
+        self._tile_combo.bind("<<ComboboxSelected>>", self._on_view_mode)
 
         for row, (lbl, var) in enumerate(
-            [("Width", self.width), ("Height", self.height), ("FPS", self.fps)], start=3
-        ):
-            ttk.Label(cam_box, text=lbl).grid(row=row, column=0, sticky="w", pady=2)
-            ttk.Entry(cam_box, textvariable=var, width=10).grid(
-                row=row, column=1, sticky="ew", padx=4
-            )
+                [("Width", self.width), ("Height", self.height), ("FPS", self.fps)], start=4):
+            ttk.Label(box, text=lbl).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(box, textvariable=var, width=10).grid(row=row, column=1, sticky="ew", padx=4)
+        ttk.Label(box, text="Format").grid(row=7, column=0, sticky="w", pady=2)
+        ttk.Combobox(box, textvariable=self.format_var, values=["mp4 (H.264)", "mp4 (H.265)"],
+                     state="readonly", width=12).grid(row=7, column=1, sticky="ew", padx=4)
+        ttk.Checkbutton(box, text="Mirror (semua source)", variable=self.mirror_var).grid(
+            row=8, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.open_btn = ttk.Button(box, text="Buka Source", command=self.toggle_camera)
+        self.open_btn.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
-        ttk.Label(cam_box, text="Format").grid(row=6, column=0, sticky="w", pady=2)
-        ttk.Combobox(
-            cam_box,
-            textvariable=self.format_var,
-            values=["mp4 (H.264)", "mp4 (H.265)"],
-            state="readonly",
-            width=12,
-        ).grid(row=6, column=1, sticky="ew", padx=4)
+    def _on_view_mode(self, _=None):
+        if self._roi_editor is not None:             # editor ROI selalu 1 source
+            self._view_mode_var.set("single")
+            return
+        self._view_mode = self._view_mode_var.get()
+        try:
+            self._tile_n = int(self._tile_combo.get())
+            self._tile_scroll = 0
+        except ValueError:
+            pass
+        tile = self._view_mode == "tile"
+        self._tile_combo.config(state="readonly" if tile else "disabled")
+        self._view_combo.config(state="disabled" if tile else "readonly")
 
-        ttk.Checkbutton(cam_box, text="Mirror", variable=self.mirror_var).grid(
-            row=7, column=0, columnspan=2, sticky="w", pady=(4, 0)
-        )
-        self.open_btn = ttk.Button(
-            cam_box, text="Buka Kamera", command=self.toggle_camera
-        )
-        self.open_btn.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-
+    def _on_view_pick(self, _=None):
+        t = self._view_combo.get()
+        if t[1:].isdigit() and self._roi_editor is None:
+            self._view_slot = int(t[1:])
     # ── Panel: YOLO ───────────────────────────────────────────────────────
 
     def _build_panel_yolo(self, parent):
         yolo_box = ttk.LabelFrame(parent, text="YOLO Detector", padding=8)
         yolo_box.pack(fill="x", pady=(0, 6))
 
-        model_row = ttk.Frame(yolo_box)
-        model_row.pack(fill="x", pady=(0, 4))
-        ttk.Entry(model_row, textvariable=self.model_path_var, width=16).pack(
-            side="left", expand=True, fill="x"
-        )
-        ttk.Button(model_row, text="Browse", command=self._browse_model, width=7).pack(
-            side="left", padx=(4, 0)
-        )
-
-        ttk.Button(yolo_box, text="Load Model", command=self._load_model).pack(
-            fill="x", pady=(0, 4)
-        )
+        ttk.Label(yolo_box, text="Model diatur per source di Logic Editor "
+                                 "(Source → Pilih Model…).",
+                  foreground="#777777", wraplength=260).pack(anchor="w", pady=(0, 4))
+        ttk.Label(yolo_box, textvariable=self.model_info_var, font=("Consolas", 9),
+                  justify="left").pack(anchor="w", pady=(0, 6))
 
         conf_hdr = ttk.Frame(yolo_box)
         conf_hdr.pack(fill="x")
@@ -2201,6 +2425,8 @@ class CTMonitorApp:
         ttk.Button(box, text="Pilih Folder", command=self.select_folder).pack(fill="x")
         ttk.Button(box, text="Sync Ukuran Video ke Server",
                    command=self._sync_sizes_now).pack(fill="x", pady=(4, 0))
+        ttk.Button(box, text="Sync Video Lama (tertahan)",
+                   command=self._resync_held_videos).pack(fill="x", pady=(4, 0))
 
     # ── Panel: Status ─────────────────────────────────────────────────────
 
@@ -2277,6 +2503,7 @@ class CTMonitorApp:
     def toggle_pause(self):
         """TEST MODE: bekukan preview, tapi timer cycle/discard tetap jalan."""
         self._paused = not self._paused
+        self.hub.paused = self._paused
         if self._paused:
             self.pause_btn.config(text="▶  RESUME  [P]")
             self.root_status.config(
@@ -2302,19 +2529,21 @@ class CTMonitorApp:
             self._state_label.config(foreground=fg)
         else:
             self._state_label.config(foreground="")
-
+    
     def _shift_tick(self):
         """Cek tiap 1 detik. Saat ganti shift: reset label dan hitung ulang dari disk."""
         try:
             name, start, end = shift_info(datetime.now())
+            self._var_clock.set(datetime.now().strftime("%d-%m-%Y  %H:%M:%S"))
             if start != self._shift_key:
                 self._shift_key = start
                 self._shift_ok = self._shift_anom = 0
                 self._var_ok_count.set("0")
                 self._var_anom_count.set("0")
-                self._var_shift.set(f"{name} ({start:%H}-{end:%H})")
-                self._resync_shift_counts(start, end)
-                logger.info(f"[Shift] {name} {start:%Y-%m-%d %H:%M} - {end:%H:%M}")
+                self._var_cycle.set("0")
+                self._var_shift.set(f"{name} ({start:%H.%M} — {end:%H.%M})")
+                self._resync_shift_counts(start, end)                              # ← HILANG
+                logger.info(f"[Shift] {name} {start:%Y-%m-%d %H:%M} - {end:%H:%M}")  # ← HILANG
         except Exception as e:
             logger.error(f"[Shift] tick error: {e}", exc_info=True)
         self.root.after(1000, self._shift_tick)
@@ -2325,19 +2554,20 @@ class CTMonitorApp:
             ok, anom = count_shift_videos(start, end)
 
             def apply():
-                if self._shift_key != start:      # shift sudah berganti lagi
+                if self._shift_key != start:
                     return
                 self._shift_ok, self._shift_anom = ok, anom
                 self._var_ok_count.set(str(ok))
                 self._var_anom_count.set(str(anom))
-            self._ui(apply)
+                self._var_cycle.set(str(ok + anom))
+
+            self._ui(apply)                                                        # ← HILANG
 
         threading.Thread(target=work, daemon=True, name="shift-count").start()
 
     def _on_cycle_ui_update(self, cycle_count: int, cycle_time: float, anom_type: str,
                             is_genesis: bool = False, skipped=None, label: str = ""):
         skipped = skipped or []
-        self._var_cycle.set(str(cycle_count))
         self._var_last_ct.set(f"{cycle_time:.1f}s")
         color = {"OK": "#2e7d32", "LONG": "#c62828", "SHORT": "#ef6c00"}[anom_type]
         if skipped and anom_type == "OK":
@@ -2358,6 +2588,7 @@ class CTMonitorApp:
             self._shift_ok += 1
         self._var_ok_count.set(str(self._shift_ok))
         self._var_anom_count.set(str(self._shift_anom))
+        self._var_cycle.set(str(self._shift_ok + self._shift_anom))
 
     def _bind_shortcuts(self):
         def key(action, cond):
@@ -2368,7 +2599,7 @@ class CTMonitorApp:
                     action()
             return h
         self.root.bind("<p>", key(self.toggle_pause, lambda: self.running))
-        self.root.bind("<f>", key(self.take_photo, lambda: self._latest_frame is not None))
+        self.root.bind("<f>", key(self.take_photo, lambda: self.hub.frame(self._view_slot) is not None))
         self.root.bind("<r>", key(self.toggle_recording, lambda: self.running))
         self.root.bind("<F11>", lambda e: self.root.attributes(
             "-fullscreen", not self.root.attributes("-fullscreen")))
@@ -2387,48 +2618,41 @@ class CTMonitorApp:
     # ──────────────────────────────────────────────────────────────────────
     #  YOLO controls
     # ──────────────────────────────────────────────────────────────────────
+    def _update_model_info(self):
+        icon = {"ready": "✓", "loading": "…", "failed": "✗ GAGAL", "none": "—"}
+        lines = [f"S{s}: {name or 'tanpa model'} {icon[st]}"
+                 for s, name, st in self.yolo.summary()]
+        self.model_info_var.set("\n".join(lines) or "Belum ada source")
 
-    def _browse_model(self):
-        path = filedialog.askopenfilename(
-            title="Pilih model YOLO (.pt)",
-            filetypes=[("PyTorch model", "*.pt"), ("All", "*.*")],
-        )
-        if path:
-            self.model_path_var.set(path)
-
-    def _load_model(self):
-        if not YOLO_AVAILABLE:
-            messagebox.showerror("Error", "pip install ultralytics")
-            return
-        path = self.model_path_var.get().strip()
-        if not path or not os.path.exists(path):
-            messagebox.showerror("Model", "File tidak ditemukan.")
-            return
-        self.root_status.config(text="Loading model...")
-        self.root.update_idletasks()
-        if self.yolo.load(path):
-            self.yolo_btn.config(state="normal")
-            self.root_status.config(text=f"Model: {os.path.basename(path)}")
-            self._logger.log("YOLO", f"loaded | {path}")
+    def _on_models_ready(self):
+        """Dipanggil (main thread) tiap status model berubah."""
+        self._update_model_info()
+        ready = self.yolo.any_ready()
+        self.yolo_btn.config(state="normal" if ready else "disabled")
+        if ready:
             self._build_class_checklist(self.yolo.get_class_names())
-            # Init cycle recorder setelah model siap
-            if not self.args.no_record and (not self.args.station_no or not self.args.line):
-                messagebox.showwarning("Model", "Identitas stasiun belum diterima dari server. "
-                                                "Tunggu status 'Terhubung ✓', lalu Load Model lagi.")
-                return
+        elif self.yolo.enabled:
+            self._toggle_yolo()
+        if self._ct_recorder is None:
             self._sync_recorder()
-            # Init reporter
-            if self._reporter is None and not getattr(self.args, "nondebug", False):
-                self._reporter = CycleReporter(self.output_dir)
-                self._logger.log("REPORT", f"CSV: {self._reporter.path()}")
-        else:
-            messagebox.showerror("Model", "Gagal load model.")
-            self.root_status.config(text="Gagal load model.")
+        if ready and self._reporter is None and not getattr(self.args, "nondebug", False):
+            self._reporter = CycleReporter(self.output_dir)
+            self._logger.log("REPORT", f"CSV: {self._reporter.path()}")
+
+    def _badge(self, img, slot):
+        st = self.yolo.slot_state(slot)
+        if st == "ready":
+            return
+        txt = {"none": "NO MODEL", "loading": "MODEL LOADING...",
+               "failed": "MODEL ERROR"}[st]
+        y = img.shape[0] - 10
+        cv2.putText(img, txt, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, txt, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1, cv2.LINE_AA)
 
     def _on_conf_change(self, _=None):
         v = round(self.conf_var.get(), 2)
         self.conf_label.config(text=f"{v:.2f}")
-        self.yolo.set_conf(v)
+        self.yolo.set_conf(min(v, self._roi_min_conf))
 
     def _toggle_yolo(self):
         self.yolo.enabled = not self.yolo.enabled
@@ -2473,17 +2697,22 @@ class CTMonitorApp:
         return "libx265" if "H.265" in self.format_var.get() else "libx264"
 
     def _sync_recorder(self):
+        slots = self.hub.slots()
+        if not slots:
+            return
+        cell = rec_cell(self.hub.sizes(), slots)
+        w, h = canvas_size(len(slots), cell)
         fps = self.OUTPUT_FPS
         if self._ct_recorder is None:
             if self.args.no_record or not self.args.station_no or not self.args.line:
                 return
+            self._cell = cell
             self._ct_recorder = VideoRecorder(
                 station_id=self.args.station_no, line=self.args.line,
-                frame_width=self._frame_w, frame_height=self._frame_h,
-                fps=fps, codec=self._codec(),
-            )
-        else:
-            self._ct_recorder.configure(self._frame_w, self._frame_h, fps, self._codec())
+                frame_width=w, frame_height=h, fps=fps, codec=self._codec())
+        elif not self._ct_recorder.recording:        # ukuran tidak boleh berubah saat merekam
+            self._cell = cell
+            self._ct_recorder.configure(w, h, fps, self._codec())
     # ──────────────────────────────────────────────────────────────────────
     #  Camera
     # ──────────────────────────────────────────────────────────────────────
@@ -2495,218 +2724,244 @@ class CTMonitorApp:
             self.start_camera()
 
     def start_camera(self):
-        try:
-            width = int(self.width.get())
-            height = int(self.height.get())
-            fps = int(self.fps.get())
-
-            if self.source_var.get() == "Video File":
-                path = self.video_path_var.get().strip()
-                if not path or not os.path.exists(path):
-                    messagebox.showerror("Video", "File tidak ditemukan.")
-                    return
-                cap = cv2.VideoCapture(path)
-                if not cap.isOpened():
-                    raise RuntimeError(f"Tidak bisa buka video: {path}")
-                source_label = os.path.basename(path)
-            else:
-                name = self.camera_name_var.get()
-                index = self._camera_map.get(name, 0)
-                cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-                if not cap.isOpened():
-                    cap.release()
-                    cap = cv2.VideoCapture(index)
-                if not cap.isOpened():
-                    raise RuntimeError(f"Tidak bisa buka kamera: {name}")
-                source_label = name
-
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            cap.set(cv2.CAP_PROP_FPS, fps)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            actual_fps = cap.get(cv2.CAP_PROP_FPS)
-
-            self.cap = cap
-            self.running = True
-            self._last_frame_ts = time.time()
-            self._set_cycle_state("IDLE")     # keluar dari CAMERA_OFFLINE
-            self._frame_w = actual_w
-            self._frame_h = actual_h
-            notes = self.yolo.engine.adapt(actual_w, actual_h, self.mirror_var.get())
-            if notes:
-                logger.info(f"[Logic] ROI disesuaikan: {', '.join(notes)}")
-            self._actual_fps = actual_fps if 0 < actual_fps <= 240 else float(fps)
-            self._measured_fps = None
-            self._fps_stable = False
-            self._sync_recorder()
-
-            self.status_var.set(
-                f"ON - {actual_w}x{actual_h} @ {self._actual_fps:.1f}fps  [{source_label}]"
-            )
-            self.open_btn.config(text="Tutup")
-            self.photo_btn.config(state="normal")
-            self.record_btn.config(state="disabled")
-            self.pause_btn.config(state="normal")
-            self._paused = False
-            self.pause_btn.config(text="⏸  PAUSE (TEST)  [P]")
-            self.root_status.config(text="Menunggu FPS stabil...")
-            self._logger.log("CAM", f"buka | {source_label} | {actual_w}x{actual_h}")
-
-            self._capture_thread = threading.Thread(
-                target=self._capture_loop, daemon=True
-            )
-            self._capture_thread.start()
-            self._schedule_ui_update()
-
-        except Exception as e:
-            if self.cap:
-                self.cap.release()
-                self.cap = None
-            self._logger.log("CAM", f"ERROR: {e}")
-            messagebox.showerror("Error", str(e))
-
-    def _capture_loop(self):
-        try:
-            ctypes.windll.kernel32.SetThreadPriority(
-                ctypes.windll.kernel32.GetCurrentThread(), 2
-            )
-        except Exception:
-            pass
-
-        is_video_file = self.source_var.get() == "Video File"
-        for _ in range(5 if not is_video_file else 0):
-            self.cap.read()
-
-        consecutive_fail = 0
-        frame_count = 0
-        fps_timer = time.perf_counter()
-        measure_n = 0
-        target_iv = 1.0 / self._actual_fps
-        next_t = time.perf_counter()
-
-        while self.running:
-            now = time.perf_counter()
-            wait = next_t - now
-            if wait > 0.002:
-                time.sleep(wait - 0.001)
-            try:
-                ret, frame = self.cap.read()
-            except Exception as e:
-                logger.error(f"[Camera] read exception: {e}")
-                ret, frame = False, None
-            now = time.perf_counter()
-            next_t += target_iv
-            if now > next_t + target_iv:
-                next_t = now + target_iv
-
-            if not ret:
-                if is_video_file:
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    next_t = time.perf_counter()
-                    continue
-                else:
-                    consecutive_fail += 1
-                    if consecutive_fail >= 10:
-                        self.root.after(0, self._on_camera_error)
-                        break
-                    continue
-
-            consecutive_fail = 0
-            self._last_frame_ts = time.time()
-            frame_count += 1
-
-            elapsed = now - fps_timer
-            if elapsed >= 3.0:
-                self._measured_fps = frame_count / elapsed
-                measure_n += 1
-                frame_count = 0
-                fps_timer = now
-                if (measure_n >= 2 or is_video_file) and not self._fps_stable:
-                    self._fps_stable = True
-                    self.root.after(0, self._on_fps_stable)
-            if self._paused:
-                continue
-            if self.mirror_var.get():
-                frame = cv2.flip(frame, 1)
-
-            with self._frame_lock:
-                self._latest_frame = frame
-
-            fd_slave_api.push_frame(frame)
-
-            self.yolo.push(frame)
-
-            # Feed ke cycle recorder jika sedang recording cycle
-            if self._ct_recorder:
-                self._ct_recorder.write_frame(frame, self._last_frame_ts)
-            if self.recording:
-                try:
-                    self._write_queue.put_nowait((frame.copy(), now))
-                except queue.Full:
-                    pass
-
-    def _on_fps_stable(self):
         if self.running:
-            self._sync_recorder()
-            self.record_btn.config(state="normal")
-            self.root_status.config(
-                text=f"Kamera aktif — {self._measured_fps:.1f}fps → output {self.OUTPUT_FPS}fps"
-            )
-
-    def _on_camera_error(self):
-        if not self.running:          # cegah dipanggil dobel (read gagal + frame beku)
             return
-        logger.error("[Camera] CRASH — frame tidak diterima")
-        self._logger.log("CAMERA", "CRASH / OFFLINE")
-        self.stop_camera(crashed=True)
+        self.running = True
+        self._paused = False
+        self.hub.paused = False
+        self._adapted.clear()
+        self._set_cycle_state("IDLE")
+        self._sync_sources()
+        self._comp_run = True
+        self._comp_thread = threading.Thread(target=self._compose_loop, daemon=True,
+                                             name="tile-composer")
+        self._comp_thread.start()
+        n = len(self.hub.slots())
+        self.status_var.set(f"ON - {n} source")
+        self.open_btn.config(text="Tutup")
+        self.photo_btn.config(state="normal")
+        self.record_btn.config(state="disabled")
+        self.pause_btn.config(state="normal", text="⏸  PAUSE (TEST)  [P]")
+        self.root_status.config(
+            text="Membuka source..." if n else "Belum ada source — tambahkan lewat Logic Editor")
+        self._schedule_ui_update()
 
     def stop_camera(self, crashed: bool = False):
         if self.recording:
             self.stop_recording()
         self.running = False
-        if self._capture_thread:
-            self._capture_thread.join(timeout=2)
-            self._capture_thread = None
-        if self.cap:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-            self.cap = None
+        self._comp_run = False
+        if self._comp_thread:
+            self._comp_thread.join(timeout=1)
+            self._comp_thread = None
+        self.hub.stop_all()
         with self._frame_lock:
             self._latest_frame = None
-
-        # Siklus yang sedang berjalan tidak valid lagi
         tracker = self.yolo._tracker
         if tracker and tracker.is_cycle_active():
             tracker.abort_cycle()
             if self._ct_recorder:
                 self._ct_recorder.discard()
-            self._logger.log(
-                "DISCARD", "camera crash — siklus dibatalkan" if crashed else "kamera ditutup"
-            )
-
+            self._logger.log("DISCARD", "source ditutup — siklus dibatalkan")
         self.preview.config(image="", text="Camera Preview")
-        self.status_var.set("KAMERA OFFLINE" if crashed else "Kamera belum dibuka")
-        src = self.source_var.get()
-        self.open_btn.config(text="Buka Video" if src == "Video File" else "Buka Kamera")
+        self.status_var.set("Source belum dibuka")
+        self.open_btn.config(text="Buka Source")
         self.photo_btn.config(state="disabled")
         self.record_btn.config(state="disabled")
-        self.pause_btn.config(state="disabled")
+        self.pause_btn.config(state="disabled", text="⏸  PAUSE (TEST)  [P]")
         self._paused = False
-        self.pause_btn.config(text="⏸  PAUSE (TEST)  [P]")
-
         self._hold_state_until = 0.0
         self._var_elapsed.set("—")
-        if crashed:
-            self._set_cycle_state("CAMERA_OFFLINE")   # → dikirim ke server via heartbeat
-            self.root_status.config(text="⚠ Kamera crash / disconnect — klik Buka Kamera untuk menyambung ulang")
-        else:
+        self._set_cycle_state("IDLE")
+        self.root_status.config(text="Source ditutup")
+
+    def _sync_sources(self, sources=None, retry: bool = False):
+        if sources is None:
+            cfg = self._logic_config
+            sources = cfg.sources if cfg else {}
+        self.yolo.assign({s: d.model for s, d in sources.items()}, retry=retry)
+        self._update_model_info()
+        req = (self._var_int(self.width, 640), self._var_int(self.height, 480),
+               self._var_int(self.fps, 24))
+        self.hub.sync(sources, bool(self.mirror_var.get()), req)
+        slots = self.hub.slots()
+        self._view_combo.config(values=[f"S{s}" for s in slots])
+        if slots and self._view_slot not in slots:
+            self._view_slot = slots[0]
+        self._view_combo.set(f"S{self._view_slot}" if slots else "")
+        n = len(slots)
+        self._tile_combo.config(values=[str(i) for i in range(1, n + 1)])
+        self._tile_n = max(1, min(self._tile_n, n)) if n else 1
+        self._tile_combo.set(str(self._tile_n))
+        if n != self._last_n:                       # ukuran tile berubah -> siklus berjalan tidak valid
+            self._last_n = n
+            if self.yolo.engine.is_cycle_active():
+                self.yolo.engine.abort_cycle()
+                if self._ct_recorder:
+                    self._ct_recorder.discard()
+        self._sync_recorder()
+
+    def _on_source_frame(self, slot, frame, ts):
+        self.yolo.push(frame, slot)
+
+    def _adapt_sources(self):
+        """Sesuaikan ROI tiap source ke resolusi/mirror aktualnya (terisolasi per slot)."""
+        if self._roi_editor is not None:        # editor mengurus adaptasinya sendiri
+            return
+        m = bool(self.mirror_var.get())
+        for slot, (w, h) in self.hub.sizes().items():
+            if not (w and h) or self._adapted.get(slot) == (w, h, m):
+                continue
+            self._adapted[slot] = (w, h, m)
+            notes = self.yolo.engine.adapt(slot, w, h, m)
+            if notes:
+                logger.info(f"[Logic] ROI disesuaikan: {', '.join(notes)}")
+        if (self.record_btn.cget("state") == "disabled"
+                and any(w and h for w, h in self.hub.sizes().values())):
+            self.record_btn.config(state="normal")
+
+    def _check_sources(self):
+        """Source yang dipakai ROI putus -> hentikan produksi; pulih -> lanjut."""
+        cfg = self._logic_config
+        if cfg is None or self._roi_editor is not None:
+            return
+        used = {r.source for r in cfg.all_rois()}
+        lost = sorted((used & self.hub.lost())
+                      | {s for s in used if self.yolo.slot_state(s) == "failed"})
+        if lost and self._var_state.get() != "CAMERA_OFFLINE":
+            self.yolo.engine_enabled = False
+            self.yolo.engine.abort_cycle()
+            if self._ct_recorder:
+                self._ct_recorder.discard()
+            self._logger.log("CAMERA", f"source offline: {lost}")
+            self._set_cycle_state("CAMERA_OFFLINE")
+            self.root_status.config(text="⚠ Source offline: " + ", ".join(f"S{s}" for s in lost))
+        elif not lost and self._var_state.get() == "CAMERA_OFFLINE":
+            self.yolo.engine_enabled = True
             self._set_cycle_state("IDLE")
-            self.root_status.config(text="Kamera ditutup")
+            self.root_status.config(text="Semua source pulih")
+
+    def _view_slots(self) -> list:
+        slots = self.hub.slots()
+        if self._view_mode == "tile":
+            return slots[:max(1, self._tile_n)]
+        return [self._view_slot] if self._view_slot in slots else slots[:1]
+
+    def _ann_frame(self, slot):
+        """Frame berlabel YOLO bila aktif, kalau tidak frame mentah."""
+        if self.yolo.enabled:
+            drawn, _, _ = self.yolo.get_result(slot)
+            if drawn is not None:
+                return drawn
+        return self.hub.frame(slot)
+
+    def _decorate_cell(self, slot, cell_img, sw, sh):
+        self.roi_view.set_scale(cell_img.shape[1], cell_img.shape[0], sw, sh)
+        self.roi_view.draw_on_frame(cell_img, slot)
+        self._badge(cell_img, slot)
+
+    def _tile_preview(self):
+        slots = self.hub.slots()                      # SEMUA source, bukan slots[:n]
+        if not slots:
+            return None
+        pw = self._preview_container.winfo_width() or 800
+        ph = self._preview_container.winfo_height() or 580
+        lost = self.hub.lost()
+
+        k = max(1, min(self._tile_n, len(slots)))     # jumlah tile yang terlihat sekaligus
+        cols, vis_rows = grid_for(k)
+        cell = (max(1, pw // cols), max(1, ph // vis_rows))
+
+        def get(s):
+            if s in lost:
+                return None
+            f = self._ann_frame(s)
+            return None if f is None else cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+
+        canvas = compose(slots, get, cell, decorate=self._decorate_cell, cols=cols)
+        total = canvas.shape[0]
+        self._tile_step = cell[1]
+        self._tile_total = total
+        self._tile_scroll = max(0, min(self._tile_scroll, max(0, total - ph)))
+        self._tile_sb_update(total, ph)
+        off = self._tile_scroll
+        return np.ascontiguousarray(canvas[off:off + ph])
+
+    def _tile_sb_update(self, total, view):
+        if total <= view:
+            self._tile_scroll = 0
+            if self._tile_sb_shown:
+                self._tile_sb.grid_remove()
+                self._tile_sb_shown = False
+            return
+        if not self._tile_sb_shown:
+            self._tile_sb.grid()
+            self._tile_sb_shown = True
+        self._tile_sb.set(self._tile_scroll / total, (self._tile_scroll + view) / total)
+
+    def _on_tile_wheel(self, e):
+        if self._view_mode != "tile" or self._roi_editor is not None:
+            return
+        up = getattr(e, "delta", 0) > 0 or getattr(e, "num", None) == 4
+        self._tile_scroll += -self._tile_step if up else self._tile_step
+
+    def _on_tile_sbar(self, *a):
+        if a[0] == "moveto":
+            self._tile_scroll = int(float(a[1]) * self._tile_total)
+        elif a[0] == "scroll":
+            self._tile_scroll += int(a[1]) * self._tile_step
+
+    def _compose_loop(self):
+        """Satu jam OUTPUT_FPS: tile semua source -> server + recorder siklus (+ rekam manual)."""
+        iv = 1.0 / self.OUTPUT_FPS
+        nxt = time.perf_counter()
+        while self._comp_run:
+            nxt += iv
+            wait = nxt - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            else:
+                nxt = time.perf_counter()
+            if self.hub.paused:
+                continue
+            try:
+                slots = self.hub.slots()
+                if not slots:
+                    continue
+                lost = self.hub.lost()
+                raw_get = lambda s: None if s in lost else self.hub.frame(s)
+                ts = time.time()
+                sizes = self.hub.sizes()
+                rec = self._ct_recorder
+                cell = self._cell
+                if cell is None or rec is None or not rec.recording:
+                    cell = rec_cell(sizes, slots)            # boleh berubah selama tidak merekam
+                    if cell != self._cell:
+                        self._cell = cell
+                        if rec:                              # tanpa codec: tidak menyentuh Tk dari thread ini
+                            w, h = canvas_size(len(slots), cell)
+                            rec.configure(w, h, self.OUTPUT_FPS)
+                canvas = compose(slots, raw_get, cell)
+                with self._frame_lock:
+                    self._latest_frame = canvas
+                fd_slave_api.push_frame(canvas, layout_meta(slots, cell, sizes=sizes))
+                if rec and (canvas.shape[1], canvas.shape[0]) == (rec.frame_width, rec.frame_height):
+                    rec.write_frame(canvas, ts)              # lewati bila ukuran tidak cocok dengan pipe ffmpeg
+
+                rs = self._rec_slots
+                if self.recording and rs:
+                    raw = compose(rs, raw_get, self._rec_cell)
+                    ann = raw
+                    if self.yolo.enabled:
+                        ann = compose(rs, lambda s: None if s in lost else self._ann_frame(s),
+                                      self._rec_cell)
+                    try:
+                        self._write_queue.put_nowait((raw, ann, time.perf_counter()))
+                    except queue.Full:
+                        pass
+            except Exception as e:
+                logger.error(f"[Tile] compose error: {e}", exc_info=True)
+
     def _on_source_change(self, *args):
         if self.source_var.get() == "Video File":
             self.cam_label.grid_remove()
@@ -2739,34 +2994,38 @@ class CTMonitorApp:
     def _schedule_ui_update(self):
         if not self.running:
             return
-
         try:
+            slot = self._view_slot
             if self.yolo.enabled:
-                drawn, raw, dets = self.yolo.get_result()
-                display = drawn if drawn is not None else raw
-                self.det_count_var.set(f"Deteksi: {len(dets)}")
-            else:
-                with self._frame_lock:
-                    display = (
-                        self._latest_frame.copy()
-                        if self._latest_frame is not None
-                        else None
-                    )
+                self.det_count_var.set(f"Deteksi: {len(self.yolo.get_result(slot)[2])}")
+            self._adapt_sources()
+            self._check_sources()
 
-            if display is not None:
-                prev_w = self._preview_container.winfo_width()
-                prev_h = self._preview_container.winfo_height()
-                rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-                resized = self._resize_for_preview(rgb, prev_w or 800, prev_h or 580)
-                rh, rw = resized.shape[:2]
-                if self._roi_editor is not None:
-                    ox = max(0, (self.preview.winfo_width() - rw) // 2)
-                    oy = max(0, (self.preview.winfo_height() - rh) // 2)
-                    self._roi_editor.set_view(rw, rh, self._frame_w, self._frame_h, ox, oy)
-                    resized = self._roi_editor.draw_on_frame(resized)
-                else:
-                    self.roi_view.set_scale(rw, rh, self._frame_w, self._frame_h)
-                    resized = self.roi_view.draw_on_frame(resized)
+            resized = None
+            if self._view_mode == "tile" and self._roi_editor is None:
+                resized = self._tile_preview()
+            else:
+                self._tile_sb_update(0, 1)
+                display = self._ann_frame(slot)
+                if display is not None:
+                    self._frame_h, self._frame_w = display.shape[:2]
+                    prev_w = self._preview_container.winfo_width()
+                    prev_h = self._preview_container.winfo_height()
+                    rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+                    resized = self._resize_for_preview(rgb, prev_w or 800, prev_h or 580)
+                    rh, rw = resized.shape[:2]
+                    if self._roi_editor is not None:
+                        ox = max(0, (self.preview.winfo_width() - rw) // 2)
+                        oy = max(0, (self.preview.winfo_height() - rh) // 2)
+                        self._roi_editor.set_view(rw, rh, self._frame_w, self._frame_h,
+                                                  ox, oy, slot=slot)
+                        resized = self._roi_editor.draw_on_frame(resized)
+                    else:
+                        self.roi_view.set_scale(rw, rh, self._frame_w, self._frame_h)
+                        resized = self.roi_view.draw_on_frame(resized)
+                        self._badge(resized, slot)
+
+            if resized is not None:
                 img = Image.fromarray(resized)
                 photo = ImageTk.PhotoImage(image=img)
                 self.preview.config(image=photo, text="")
@@ -2800,11 +3059,7 @@ class CTMonitorApp:
                     sl = self._short_limit()
                     self._var_short_lim.set(f"{sl:.1f}" if sl > 0 else "off")
             # Timer anomaly + discard
-            if (self.running and not self._paused
-                    and self.source_var.get() != "Video File"
-                    and time.time() - self._last_frame_ts > 3.0):
-                self._on_camera_error()
-                return
+
             self._check_timers()
             if not (self.yolo._tracker and self.yolo._tracker.is_cycle_active()):
                 self._var_elapsed.set("—")
@@ -2830,14 +3085,14 @@ class CTMonitorApp:
     # ──────────────────────────────────────────────────────────────────────
 
     def take_photo(self):
-        with self._frame_lock:
-            if self._latest_frame is None:
-                return
-            raw = self._latest_frame.copy()
+        raw = self.hub.frame(self._view_slot)
+        if raw is None:
+            return
+        raw = raw.copy()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         cv2.imwrite(os.path.join(self.output_dir, f"photo_{ts}_raw.jpg"), raw)
         if self.yolo.enabled:
-            drawn, _, _ = self.yolo.get_result()
+            drawn, _, _ = self.yolo.get_result(self._view_slot)     # <- sebelumnya REC_SLOT
             if drawn is not None:
                 cv2.imwrite(os.path.join(self.output_dir, f"photo_{ts}_ann.jpg"), drawn)
         self._photo_count += 1
@@ -2892,17 +3147,30 @@ class CTMonitorApp:
         if not shutil.which("ffmpeg"):
             messagebox.showerror("Error", "FFmpeg tidak ditemukan.")
             return
-        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        slots = self._view_slots()
+        if not slots:
+            messagebox.showwarning("Rekam", "Belum ada source.")
+            return
+        if len(slots) == 1:
+            w, h = self.hub.size(slots[0])
+            if not (w and h):
+                messagebox.showwarning("Rekam", f"S{slots[0]} belum menghasilkan frame.")
+                return
+            cell = (w - w % 2, h - h % 2)           # yuv420p butuh ukuran genap
+        else:
+            cell = fixed_cell(len(slots))
+        width, height = canvas_size(len(slots), cell)
         codec = "libx265" if "H.265" in self.format_var.get() else "libx264"
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._video_raw = os.path.join(self.output_dir, f"video_{ts}_raw.mp4")
         self._video_ann = os.path.join(self.output_dir, f"video_{ts}_ann.mp4")
         self._ffmpeg_raw = self._make_pipe(self._video_raw, width, height, codec, "28")
         self._ffmpeg_ann = self._make_pipe(self._video_ann, width, height, codec, "28")
+        self._write_queue = queue.Queue(maxsize=120)     # harus sebelum recording = True
+        self._rec_cell = cell
+        self._rec_slots = slots                          # dikunci sampai berhenti
         self.recording = True
         self.record_start_time = time.time()
-        self._write_queue = queue.Queue(maxsize=120)
         self._writer_thread = threading.Thread(target=self._writer_worker, daemon=True)
         self._writer_thread.start()
         self.record_btn.config(text="⏹  STOP REKAM  [R]")
@@ -2918,7 +3186,7 @@ class CTMonitorApp:
             item = self._write_queue.get()
             if item is None:
                 break
-            raw_frame, capture_ts = item
+            raw_frame, ann_frame, capture_ts = item
             if last_ts is None:
                 repeat = 1
                 debt = 0.0
@@ -2929,11 +3197,6 @@ class CTMonitorApp:
                 debt = total_due - (repeat * frame_dur)
                 repeat = max(1, repeat)
             last_ts = capture_ts
-            ann_frame = raw_frame
-            if self.yolo.enabled:
-                drawn, _, _ = self.yolo.get_result()
-                if drawn is not None:
-                    ann_frame = drawn
             raw_bytes = raw_frame.tobytes()
             ann_bytes = ann_frame.tobytes()
             for _ in range(repeat):
@@ -2950,6 +3213,7 @@ class CTMonitorApp:
 
     def stop_recording(self):
         self.recording = False
+        self._rec_slots = []
         dur = time.time() - self.record_start_time if self.record_start_time else 0
         if self._writer_thread and self._writer_thread.is_alive():
             self._write_queue.put(None)

@@ -52,7 +52,9 @@ import queue
 from logic_bridge import SequenceTester, check_config, template_text
 from plc_logic import compile_program
 from plc_engine import Engine
-XML_VERSION = "3"
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+XML_VERSION = "4"
 DEFAULT_XML = Path(__file__).parent / "config" / "logic_config.xml"
 
 ROLE_INPUT = "input"
@@ -62,7 +64,19 @@ TAG_MANDATORY = "mandatory"
 TAG_EXPECTED = "expected"
 TAGS = (TAG_MANDATORY, TAG_EXPECTED)
 MIN_ROI_PX = 10
+MAX_SOURCES = 9
 
+
+@dataclass
+class SourceDef:
+    slot: int
+    kind: str = "camera"      # camera | video
+    device: str = "0"         # indeks kamera atau path file
+    name: str = ""
+    width: int = 0            # ukuran frame terakhir yang dikenal (0 = belum diketahui)
+    height: int = 0
+    mirror: bool = False
+    model: str = ""           # path model YOLO; "" = source tanpa model (tanpa ROI)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Model data (tanpa Tk — bisa dipakai main.py)
@@ -84,7 +98,7 @@ class RoiDef:
     group: str = ""                             # "" = tidak eksklusif
     dwell: float = 0.0                          # detik: harus bertahan di ROI sebelum dihitung
     grace: float = 0.0                          # detik: tetap dianggap di ROI setelah deteksi hilang
-
+    source: int = 1                             # slot source; rect = piksel di frame source ITU
 
 @dataclass
 class LogicConfig:
@@ -92,15 +106,15 @@ class LogicConfig:
     output: Optional[RoiDef] = None
     memory: dict = field(default_factory=lambda: {"aliases": {}})
     sequence: list = field(default_factory=list)
-    frame_w: int = 0
-    frame_h: int = 0
-    mirror: bool = False
     skip_mode: str = "immediate"                # immediate | final
     restart_on_input: bool = False
     single: bool = False                        # satu deteksi hanya boleh kena satu ROI
     max_det: int = 0                            # 0 = tanpa batas; K = K deteksi ber-conf tertinggi
     program: str = ""                           # kosong = template; isi = program PLC teks
+    sources: dict = field(default_factory=dict)
 
+    def rois_of(self, slot: int) -> list:
+        return [r for r in self.all_rois() if r.source == slot]
     def all_rois(self) -> list:
         out = []
         if self.input:
@@ -121,9 +135,16 @@ class LogicConfig:
         return f"s{max(nums, default=0) + 1}"
 
 
-def validate(cfg: LogicConfig, frame_size: tuple = (0, 0)):
+def validate(cfg: LogicConfig):
     """Return (errors, warnings). Error = tidak boleh disimpan."""
     errors, warnings = [], []
+    n = len(cfg.sources)
+    if n == 0:
+        errors.append("Minimal 1 source.")
+    if n > MAX_SOURCES:
+        errors.append(f"Maksimal {MAX_SOURCES} source.")
+    if sorted(cfg.sources) != list(range(1, n + 1)):
+        errors.append("Slot source harus berurutan 1..N tanpa lubang.")
     if cfg.input is None:
         errors.append("ROI Input belum dibuat.")
     if cfg.output is None:
@@ -131,12 +152,13 @@ def validate(cfg: LogicConfig, frame_size: tuple = (0, 0)):
     if not any(r.tag == TAG_MANDATORY for r in cfg.sequence):
         errors.append("Minimal 1 sequence ROI harus bertag 'mandatory'.")
 
-    seen = set()
     for i, r in enumerate(cfg.sequence, 1):
         if r.tag not in TAGS:
             errors.append(f"Sequence {i}: tag harus 'mandatory' atau 'expected'.")
         if not r.description.strip():
             errors.append(f"Sequence {i}: keterangan wajib diisi.")
+
+    seen = set()
     for r in cfg.all_rois():
         if r.id in seen:
             errors.append(f"ID ROI dobel: {r.id}")
@@ -144,45 +166,65 @@ def validate(cfg: LogicConfig, frame_size: tuple = (0, 0)):
         x1, y1, x2, y2 = r.rect
         if (x2 - x1) < MIN_ROI_PX or (y2 - y1) < MIN_ROI_PX:
             errors.append(f"ROI '{r.id}' terlalu kecil (< {MIN_ROI_PX}px).")
-        fw, fh = frame_size
-        if fw and fh and (x1 < 0 or y1 < 0 or x2 > fw or y2 > fh):
-            warnings.append(f"ROI '{r.id}' melewati batas frame {fw}x{fh}.")
+        s = cfg.sources.get(r.source)
+        if s is None:
+            errors.append(f"ROI '{r.id}': source {r.source} tidak ada.")
+        elif s.width <= 0 or s.height <= 0:
+            errors.append(f"ROI '{r.id}': ukuran frame source {r.source} belum diketahui.")
+        elif x1 < 0 or y1 < 0 or x2 > s.width or y2 > s.height:
+            errors.append(f"ROI '{r.id}' keluar dari frame source {r.source} "
+                          f"({s.width}x{s.height}).")
+        if s is not None and not (s.model or "").strip():
+            errors.append(f"ROI '{r.id}': source {r.source} tidak punya model — "
+                          f"pilih model untuk source itu atau hapus ROI.")
+    used = {r.source for r in cfg.all_rois()}
+    devs = {}
+    for slot, s in sorted(cfg.sources.items()):
+        if slot not in used:
+            warnings.append(f"Source S{slot} tidak punya ROI.")
+        key = (s.kind, str(s.device))
+        if key in devs:
+            warnings.append(f"S{slot} memakai device yang sama dengan S{devs[key]} ({s.device}).")
+        devs.setdefault(key, slot)
+    for slot, s in sorted(cfg.sources.items()):
+        if s.model and not Path(s.model).exists():
+            warnings.append(f"S{slot}: file model tidak ditemukan ({s.model}).")
     e2, w2 = check_config(cfg)
-    errors += e2
-    warnings += w2
-    return errors, warnings
+    return errors + e2, warnings + w2
 
-
-def adapt_to_frame(cfg: LogicConfig, fw: int, fh: int, mirror: bool) -> list:
-    """Sesuaikan koordinat ke resolusi/mirror aktif. Return catatan perubahan."""
+def adapt_to_frame(cfg: LogicConfig, slot: int, fw: int, fh: int, mirror: bool) -> list:
+    """Sesuaikan ROI milik SATU source ke resolusi/mirror frame aktifnya."""
     notes = []
-    if not (fw and fh):
+    s = cfg.sources.get(slot)
+    if s is None or not (fw and fh):
         return notes
-    if cfg.mirror != mirror and cfg.frame_w:
-        W = cfg.frame_w
-        for r in cfg.all_rois():
-            x1, y1, x2, y2 = r.rect
-            r.rect = (W - x2, y1, W - x1, y2)
-        notes.append("mirror dibalik")
-    if cfg.frame_w and cfg.frame_h and (cfg.frame_w != fw or cfg.frame_h != fh):
-        sx, sy = fw / cfg.frame_w, fh / cfg.frame_h
-        for r in cfg.all_rois():
-            x1, y1, x2, y2 = r.rect
-            r.rect = (int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy))
-        notes.append(f"di-rescale {cfg.frame_w}x{cfg.frame_h} -> {fw}x{fh}")
-    cfg.frame_w, cfg.frame_h, cfg.mirror = fw, fh, mirror
+    rois = cfg.rois_of(slot)
+    if s.width and s.height:
+        if s.mirror != bool(mirror):
+            W = s.width
+            for r in rois:
+                x1, y1, x2, y2 = r.rect
+                r.rect = (W - x2, y1, W - x1, y2)
+            notes.append(f"S{slot}: mirror dibalik")
+        if (s.width, s.height) != (fw, fh):
+            sx, sy = fw / s.width, fh / s.height
+            for r in rois:
+                x1, y1, x2, y2 = r.rect
+                r.rect = (int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy))
+            notes.append(f"S{slot}: di-rescale {s.width}x{s.height} -> {fw}x{fh}")
+    s.width, s.height, s.mirror = fw, fh, bool(mirror)
     return notes
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  XML
 # ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _write_geom(el: ET.Element, r: RoiDef):
+def _write_geom(el: ET.Element, r: RoiDef, cfg: LogicConfig):
+    s = cfg.sources[r.source]
     el.set("id", r.id)
-    for k, v in zip(("x1", "y1", "x2", "y2"), r.rect):
-        el.set(k, str(int(v)))
+    el.set("source", str(int(r.source)))
+    x1, y1, x2, y2 = r.rect
+    for k, v in zip(("nx1", "ny1", "nx2", "ny2"),
+                    (x1 / s.width, y1 / s.height, x2 / s.width, y2 / s.height)):
+        el.set(k, f"{v:.6f}")
     el.set("classes", ",".join(sorted(r.classes)))
     el.set("conf", f"{r.conf:.3f}")
     el.set("mode", r.mode)
@@ -193,6 +235,7 @@ def _write_geom(el: ET.Element, r: RoiDef):
     el.set("grace", f"{r.grace:g}")
 
 
+
 def save_logic_xml(path, cfg: LogicConfig):
     errors, _ = validate(cfg)
     if errors:
@@ -200,18 +243,27 @@ def save_logic_xml(path, cfg: LogicConfig):
     root = ET.Element("logic_config")
     root.set("version", XML_VERSION)
     root.set("saved_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    root.set("frame_width", str(cfg.frame_w))
-    root.set("frame_height", str(cfg.frame_h))
-    root.set("mirror", "true" if cfg.mirror else "false")
     root.set("skip_mode", cfg.skip_mode)
     root.set("restart_on_input", "true" if cfg.restart_on_input else "false")
     root.set("single", "true" if cfg.single else "false")
     root.set("max_det", str(int(cfg.max_det)))
 
+    srcs = ET.SubElement(root, "sources")
+    for slot, s in sorted(cfg.sources.items()):
+        e = ET.SubElement(srcs, "source")
+        e.set("slot", str(slot))
+        e.set("kind", s.kind)
+        e.set("device", str(s.device))
+        e.set("name", s.name)
+        e.set("width", str(int(s.width)))
+        e.set("height", str(int(s.height)))
+        e.set("mirror", "true" if s.mirror else "false")
+        e.set("model", s.model)
+
     for r, role in ((cfg.input, ROLE_INPUT), (cfg.output, ROLE_OUTPUT)):
         el = ET.SubElement(root, "main_roi")
         el.set("role", role)
-        _write_geom(el, r)
+        _write_geom(el, r, cfg)
 
     seq = ET.SubElement(root, "sequence")
     for i, r in enumerate(cfg.sequence, 1):
@@ -219,32 +271,44 @@ def save_logic_xml(path, cfg: LogicConfig):
         el.set("order", str(i))
         el.set("tag", r.tag)
         el.set("description", r.description.strip())
-        _write_geom(el, r)
+        _write_geom(el, r, cfg)
 
     if cfg.program.strip():
         ET.SubElement(root, "program").text = cfg.program.strip("\n")
-    tree = ET.ElementTree(root)
-    ET.indent(tree, space="  ")
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
     mem = ET.SubElement(root, "memory")
     for name, item in cfg.memory.get("aliases", {}).items():
         m = ET.SubElement(mem, "alias")
         m.set("name", name)
         m.set("address", item.get("address", ""))
         m.set("type", item.get("type", "BOOL"))
+
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     tree.write(tmp, encoding="utf-8", xml_declaration=True)
     os.replace(tmp, path)
 
-
-def _read_roi(el: ET.Element, role: str) -> RoiDef:
-    cls = el.get("classes", "")
+def _read_roi(el: ET.Element, role: str, cfg: LogicConfig) -> RoiDef:
+    slot = int(el.get("source", 1) or 1)
+    s = cfg.sources.get(slot)
+    if s is None:
+        raise ValueError(f"ROI '{el.get('id', '')}': source {slot} tidak ada.")
+    if el.get("nx1") is not None:                      # v4: ternormalisasi
+        if s.width <= 0 or s.height <= 0:
+            raise ValueError(f"ROI '{el.get('id', '')}': ukuran source {slot} tidak valid.")
+        n = [float(el.get(k)) for k in ("nx1", "ny1", "nx2", "ny2")]
+        rect = (round(n[0] * s.width), round(n[1] * s.height),
+                round(n[2] * s.width), round(n[3] * s.height))
+    else:                                              # v3: piksel
+        rect = tuple(int(el.get(k)) for k in ("x1", "y1", "x2", "y2"))
     return RoiDef(
         id=el.get("id", ""),
         role=role,
-        rect=tuple(int(el.get(k)) for k in ("x1", "y1", "x2", "y2")),
-        classes={c for c in cls.split(",") if c},
+        rect=rect,
+        source=slot,
+        classes={c for c in el.get("classes", "").split(",") if c},
         conf=float(el.get("conf", "0.25") or 0.25),
         tag=el.get("tag", ""),
         description=el.get("description", ""),
@@ -261,27 +325,53 @@ def load_logic_xml(path) -> LogicConfig:
     root = ET.parse(path).getroot()
     if root.tag != "logic_config":
         raise ValueError("Bukan file logic_config.")
-    cfg = LogicConfig(
-        frame_w=int(root.get("frame_width", 0) or 0),
-        frame_h=int(root.get("frame_height", 0) or 0),
-        mirror=root.get("mirror", "false") == "true",
-    )
+    ver = root.get("version", "")
+    cfg = LogicConfig()
     cfg.skip_mode = root.get("skip_mode", "immediate") or "immediate"
     cfg.restart_on_input = root.get("restart_on_input", "false") == "true"
     cfg.single = root.get("single", "false") == "true"
     cfg.max_det = int(root.get("max_det", "0") or 0)
+
+    if ver == "3":                                     # lama: 1 source implisit
+        cfg.sources[1] = SourceDef(
+            slot=1, kind="camera", device="0", name="Source 1",
+            width=int(root.get("frame_width", 0) or 0),
+            height=int(root.get("frame_height", 0) or 0),
+            mirror=root.get("mirror", "false") == "true")
+    elif ver == XML_VERSION:
+        se = root.find("sources")
+        if se is None:
+            raise ValueError("Elemen <sources> tidak ada.")
+        for e in se.findall("source"):
+            try:
+                slot = int(e.get("slot"))
+            except (TypeError, ValueError):
+                raise ValueError("Atribut slot pada <source> tidak valid.")
+            if slot in cfg.sources:
+                raise ValueError(f"Slot source dobel: {slot}")
+            cfg.sources[slot] = SourceDef(
+                slot=slot, kind=e.get("kind", "camera"), device=e.get("device", "0"),
+                name=e.get("name", ""), width=int(e.get("width", 0) or 0),
+                height=int(e.get("height", 0) or 0), mirror=e.get("mirror", "false") == "true",
+                model=e.get("model", ""))
+        n = len(cfg.sources)
+        if not (1 <= n <= MAX_SOURCES) or sorted(cfg.sources) != list(range(1, n + 1)):
+            raise ValueError(f"Slot source harus 1..N berurutan, maksimal {MAX_SOURCES}.")
+    else:
+        raise ValueError(f"Versi XML '{ver}' tidak didukung.")
+
     prog = root.find("program")
     cfg.program = (prog.text or "") if prog is not None else ""
     for el in root.findall("main_roi"):
         role = el.get("role")
         if role == ROLE_INPUT:
-            cfg.input = _read_roi(el, ROLE_INPUT)
+            cfg.input = _read_roi(el, ROLE_INPUT, cfg)
         elif role == ROLE_OUTPUT:
-            cfg.output = _read_roi(el, ROLE_OUTPUT)
+            cfg.output = _read_roi(el, ROLE_OUTPUT, cfg)
     seq = root.find("sequence")
     if seq is not None:
         rows = sorted(seq.findall("roi"), key=lambda e: int(e.get("order", 0) or 0))
-        cfg.sequence = [_read_roi(e, ROLE_SEQ) for e in rows]
+        cfg.sequence = [_read_roi(e, ROLE_SEQ, cfg) for e in rows]
     mem = root.find("memory")
     if mem is not None:
         for m in mem.findall("alias"):
@@ -290,7 +380,6 @@ def load_logic_xml(path) -> LogicConfig:
                 "type": m.get("type", "BOOL"),
             }
     return cfg
-
 
 def open_program_in_ld(parent, cfg: LogicConfig, on_applied=None):
     """Buka program aktif (cfg.program atau template) di LDEditor, simpan balik hasil edit."""
@@ -624,7 +713,10 @@ class LogicEditorPanel(ttk.Frame):
                  on_close: Optional[Callable] = None,
                  set_status: Optional[Callable] = None,
                  get_live: Optional[Callable] = None,
-                 transport: Optional["VideoTransport"] = None):
+                 transport: Optional["VideoTransport"] = None,
+                 on_select_source: Optional[Callable] = None,
+                 on_sources_changed: Optional[Callable] = None):
+        
         super().__init__(parent)
         self._preview = preview_widget
         self.get_frame_size = get_frame_size
@@ -662,8 +754,14 @@ class LogicEditorPanel(ttk.Frame):
         self._bindtag = f"LogicEditor{id(self)}"
         self._old_cursor = "crosshair"
         self._progress: dict = {}      # id ROI -> "done" | "skip"
+        self._slot = 1
+        self.on_select_source = None
+        self.on_sources_changed = None
         self._build_ui()
         self.load(silent=True)
+        self._refresh()
+        self.on_select_source = on_select_source
+        self.on_sources_changed = on_sources_changed
         self._refresh()
 
     # ── UI ─────────────────────────────────────────────────────────────────
@@ -745,7 +843,35 @@ class LogicEditorPanel(ttk.Frame):
         ).pack(anchor="w")
 
         self._build_transport_box()
-
+        src_box = ttk.LabelFrame(ui, text="0. Source (maks. 9)", padding=6)
+        src_box.pack(fill="x", pady=(4, 6))
+        self._src_var = tk.StringVar(value="")
+        ttk.Label(src_box, textvariable=self._src_var, foreground="#555555",
+                  wraplength=270).pack(anchor="w")
+        pick = ttk.Frame(src_box)
+        pick.pack(fill="x", pady=(4, 0))
+        ttk.Label(pick, text="Source aktif:").pack(side="left")
+        self._src_pick = ttk.Combobox(pick, state="disabled", width=6, values=[])
+        self._src_pick.pack(side="left", padx=(6, 0))
+        self._src_pick.bind("<<ComboboxSelected>>", self._on_src_pick)
+        mrow = ttk.Frame(src_box)
+        mrow.pack(fill="x", pady=(4, 0))
+        ttk.Label(mrow, text="Model:").pack(side="left")
+        self._model_var = tk.StringVar(value="—")
+        ttk.Label(mrow, textvariable=self._model_var, foreground="#555555",
+                  wraplength=170).pack(side="left", padx=(6, 0))
+        mb = ttk.Frame(src_box)
+        mb.pack(fill="x", pady=(4, 0))
+        ttk.Button(mb, text="Pilih Model…", command=self._pick_model).pack(
+            side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(mb, text="Tanpa model", command=self._clear_model).pack(
+            side="left", fill="x", expand=True)
+        brow = ttk.Frame(src_box)
+        brow.pack(fill="x", pady=(4, 0))
+        ttk.Button(brow, text="＋ Add Source", command=self._add_source_dialog).pack(
+            side="left", fill="x", expand=True, padx=(0, 2), ipady=2)
+        ttk.Button(brow, text="Hapus", command=self._remove_source).pack(
+            side="left", fill="x", expand=True, ipady=2)
         main_box = ttk.LabelFrame(
             ui, text="1. ROI Utama (wajib)", padding=6
         )
@@ -764,11 +890,11 @@ class LogicEditorPanel(ttk.Frame):
 
         tree_row = ttk.Frame(seq_box)
         tree_row.pack(fill="x")
-        self.tree = ttk.Treeview(tree_row, columns=("no", "tag", "desc", "conf", "chk"),
+        self.tree = ttk.Treeview(tree_row, columns=("no", "src", "tag", "desc", "conf", "chk"),
                                  show="headings", height=9, selectmode="browse")
-        for col, text, w, anchor in (("no", "#", 34, "center"), ("tag", "Tag", 70, "w"),
-                                     ("desc", "Keterangan", 120, "w"), ("conf", "Conf", 38, "center"),
-                                     ("chk", "✓", 30, "center")):
+        for col, text, w, anchor in (("no", "#", 34, "center"), ("src", "Src", 34, "center"),
+                                     ("tag", "Tag", 66, "w"), ("desc", "Keterangan", 100, "w"),
+                                     ("conf", "Conf", 38, "center"), ("chk", "✓", 28, "center")):
             self.tree.heading(col, text=text)
             self.tree.column(col, width=w, anchor=anchor, stretch=(col == "desc"))
         self.tree.tag_configure("input", foreground="#2e7d32")
@@ -804,16 +930,22 @@ class LogicEditorPanel(ttk.Frame):
         act = ttk.Frame(self._bottom)
         act.pack(fill="x")
         # (tiga tombol Simpan / Muat / Tutup di dalam `act` tidak berubah)
-        ttk.Label(self._bottom, text=f"File: {self.xml_path.name}", foreground="#777777").pack(
-            anchor="w", pady=(4, 0))
+        self._file_var = tk.StringVar(value="")
+        act = ttk.Frame(self._bottom)
+        act.pack(fill="x")
         ttk.Button(act, text="💾 Simpan", command=self.save).pack(
             side="left", fill="x", expand=True, ipady=3, padx=(0, 2))
-        ttk.Button(act, text="📂 Muat", command=self._load_dialog).pack(
+        ttk.Button(act, text="📝 Simpan Sebagai…", command=self.save_as).pack(
             side="left", fill="x", expand=True, ipady=3, padx=(2, 2))
-        ttk.Button(act, text="Tutup", command=self._close).pack(
+        act2 = ttk.Frame(self._bottom)
+        act2.pack(fill="x", pady=(4, 0))
+        ttk.Button(act2, text="📂 Muat", command=self._load_dialog).pack(
+            side="left", fill="x", expand=True, ipady=3, padx=(0, 2))
+        ttk.Button(act2, text="Tutup", command=self._close).pack(
             side="left", fill="x", expand=True, ipady=3, padx=(2, 0))
-        ttk.Label(self, text=f"File: {self.xml_path.name}", foreground="#777777").pack(
-            anchor="w", pady=(4, 0))
+        ttk.Label(self._bottom, textvariable=self._file_var, foreground="#777777",
+                  wraplength=270).pack(anchor="w", pady=(4, 0))
+
 
     # ── Kontrol video (hanya tampil bila sumber = video) ───────────────────
 
@@ -981,6 +1113,7 @@ class LogicEditorPanel(ttk.Frame):
         w.bind_class(self._bindtag, "<B1-Motion>", self._on_drag)
         w.bind_class(self._bindtag, "<ButtonRelease-1>", self._on_release)
         w.config(cursor="arrow")
+        self._notify_source()
         self._bind_keys()
 
     def detach(self):
@@ -999,7 +1132,9 @@ class LogicEditorPanel(ttk.Frame):
         self._update_transport_ui()
         self._refresh()
 
-    def set_view(self, preview_w, preview_h, frame_w, frame_h, offset_x, offset_y):
+    def set_view(self, preview_w, preview_h, frame_w, frame_h, offset_x, offset_y, slot=None):
+        if slot is not None and slot != self._slot:
+            return                                   # frame masih milik source lain
         if preview_w and preview_h:
             self._sx = frame_w / preview_w
             self._sy = frame_h / preview_h
@@ -1056,24 +1191,21 @@ class LogicEditorPanel(ttk.Frame):
 
     def _sync_to_frame(self):
         fw, fh = self.get_frame_size()
-        if not (fw and fh):
+        if not (fw and fh) or self._slot not in self.cfg.sources:
             return
-        mirror = bool(self.get_mirror())
-        cfg = self.cfg
-        if not cfg.all_rois():
-            cfg.frame_w, cfg.frame_h, cfg.mirror = fw, fh, mirror
+        s = self.cfg.sources[self._slot]
+        if (s.width, s.height, s.mirror) == (fw, fh, bool(self.get_mirror())):
             return
-        if (cfg.frame_w, cfg.frame_h, cfg.mirror) == (fw, fh, mirror):
-            return
-        notes = adapt_to_frame(cfg, fw, fh, mirror)
-        if notes:
+        notes = adapt_to_frame(self.cfg, self._slot, fw, fh, bool(self.get_mirror()))
+        if notes or not (s.width and s.height):
             self._mark_dirty()
+        if notes:
             self._say("ROI disesuaikan: " + ", ".join(notes))
 
     # ── Mouse ──────────────────────────────────────────────────────────────
 
     def _hit(self, mx, my):
-        rois = self.cfg.all_rois()
+        rois = self.cfg.rois_of(self._slot)
         order = sorted(reversed(rois), key=lambda r: r.id != self._sel_id)  # terpilih dulu
         rr = self.HANDLE_R + self.HIT_MARGIN
         for r in order:
@@ -1151,15 +1283,103 @@ class LogicEditorPanel(ttk.Frame):
             if self._moved:
                 self._mark_dirty()
         return "break"
+    def _notify_source(self):
+        if self._attached and self.on_select_source and self._slot in self.cfg.sources:
+            self.on_select_source(self._slot)
 
+    def _activate(self, slot, keep_sel=False):
+        if self.cfg.sources and slot not in self.cfg.sources:
+            slot = min(self.cfg.sources)
+        self._slot = slot
+        if not keep_sel:
+            self._sel_id = None
+        self._notify_source()
+        self._refresh()
+
+    def _on_src_pick(self, _=None):
+        t = self._src_pick.get()
+        if t[1:].isdigit():
+            self._activate(int(t[1:]))
+
+    def _sources_changed(self):
+        self._mark_dirty()
+        if self.on_sources_changed:
+            self.on_sources_changed(self.cfg.sources)
+
+    def add_source(self, kind: str, device, name: str = "", model: str = "") -> bool:
+        """Dipakai tombol Add Source dan host (mis. argumen CLI)."""
+        if len(self.cfg.sources) >= MAX_SOURCES:
+            messagebox.showinfo("Source", f"Maksimal {MAX_SOURCES} source.")
+            return False
+        slot = len(self.cfg.sources) + 1          # slot selalu berurutan
+        label = name or (Path(str(device)).name if kind == "video" else f"Kamera {device}")
+        self.cfg.sources[slot] = SourceDef(slot, kind, str(device), name=label)
+        self._sources_changed()
+        self._activate(slot)
+        self.cfg.sources[slot] = SourceDef(slot, kind, str(device), name=label, model=model)
+        return True
+
+    def _add_source_dialog(self):
+        top = self.winfo_toplevel()
+        ans = messagebox.askyesnocancel(
+            "Add Source", f"Sumber untuk S{len(self.cfg.sources) + 1}:\n\n"
+                          "Ya = file video\nTidak = kamera (indeks)", parent=top)
+        if ans is None:
+            return
+        if ans:
+            path = filedialog.askopenfilename(
+                title="Pilih video",
+                filetypes=[("Video", "*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm"),
+                           ("Semua file", "*.*")])
+            if path:
+                self.add_source("video", path)
+        else:
+            idx = simpledialog.askinteger("Kamera", "Indeks kamera (0, 1, ...):",
+                                          minvalue=0, parent=top)
+            if idx is not None:
+                self.add_source("camera", str(idx))
+
+    def _remove_source(self):
+        cfg, slot = self.cfg, self._slot
+        if slot not in cfg.sources:
+            return
+        n = len(cfg.rois_of(slot))
+        if not messagebox.askyesno(
+                "Hapus source", f"Hapus S{slot}" + (f" beserta {n} ROI-nya?" if n else "?")):
+            return
+        if cfg.input and cfg.input.source == slot:
+            cfg.input = None
+        if cfg.output and cfg.output.source == slot:
+            cfg.output = None
+        cfg.sequence = [r for r in cfg.sequence if r.source != slot]
+        new = {}
+        for s in sorted(cfg.sources):
+            if s == slot:
+                continue
+            d = cfg.sources[s]
+            d.slot = s - 1 if s > slot else s      # geser turun agar tetap 1..N
+            new[d.slot] = d
+        for r in cfg.all_rois():
+            if r.source > slot:
+                r.source -= 1
+        cfg.sources = new
+        self._sources_changed()
+        self._activate(min(slot, len(new)) or 1)
     # ── Aksi ───────────────────────────────────────────────────────────────
 
     def _arm(self, role):
         fw, fh = self.get_frame_size()
-        if not (fw and fh):
-            messagebox.showinfo("Logic Editor", "Buka kamera / video dulu sebelum menggambar ROI.")
+        if self._slot not in self.cfg.sources:
+            messagebox.showinfo("Logic Editor", "Klik ＋ Add Source dulu.")
             return
-        if role == ROLE_SEQ and not (self.cfg.input and self.cfg.output):
+        if not (fw and fh):
+            messagebox.showinfo("Logic Editor", f"Source S{self._slot} belum menghasilkan frame.")
+            return
+        if not (self.cfg.sources[self._slot].model or "").strip():
+            messagebox.showwarning(
+                "Logic Editor",
+                f"S{self._slot} tidak punya model, jadi tidak bisa diberi ROI.\n\n"
+                "Pilih model untuk source ini (Pilih Model…) atau pindah ke source lain.")
             return
         self._armed = None if self._armed == role else role
         if self._armed and self._video_active() and not self.transport.is_paused():
@@ -1200,10 +1420,11 @@ class LogicEditorPanel(ttk.Frame):
             roi = RoiDef(self.cfg.next_seq_id(), ROLE_SEQ, rect, res["classes"], res["conf"],
                          res["tag"], res["description"])
             self.cfg.sequence.append(roi)
-        fw, fh = self.get_frame_size()
-        self.cfg.frame_w, self.cfg.frame_h = fw, fh
+        roi.source = self._slot
+        s = self.cfg.sources[self._slot]
+        s.width, s.height = self.get_frame_size()
+        s.mirror = bool(self.get_mirror())
         self._apply_adv(roi, res)
-        self.cfg.mirror = bool(self.get_mirror())
         self._sel_id = roi.id
         self._mark_dirty()
         self._refresh()
@@ -1258,11 +1479,64 @@ class LogicEditorPanel(ttk.Frame):
         sel = self.tree.selection()
         self._sel_id = sel[0] if sel else None
         self._update_buttons()
+        r = self.cfg.find(self._sel_id)
+        if r is not None and r.source != self._slot:
+            self._activate(r.source, keep_sel=True)
 
     def _refresh(self):
         self._refresh_tree()
         self._update_buttons()
         self._dirty_var.set("● belum disimpan" if self._dirty else "")
+        self._file_var.set(f"File: {self.xml_path.name}")
+        vals = [f"S{s}" for s in sorted(self.cfg.sources)]
+        self._src_pick.config(values=vals, state="readonly" if vals else "disabled")
+        s = self.cfg.sources.get(self._slot)
+        if s:
+            self._src_pick.set(f"S{self._slot}")
+            size = f"{s.width}x{s.height}" if s.width else "belum dibuka"
+            self._src_var.set(f"{len(vals)}/{MAX_SOURCES} source. Aktif S{self._slot}: "
+                              f"{s.name} ({s.kind} {s.device}), {size}")
+            self._model_var.set(Path(s.model).name if s.model else "tanpa model")
+        else:
+            self._src_pick.set("")
+            self._src_var.set("Belum ada source. Klik ＋ Add Source.")
+            self._model_var.set("—")
+
+    def _pick_model(self):
+        s = self.cfg.sources.get(self._slot)
+        if s is None:
+            messagebox.showinfo("Model", "Klik ＋ Add Source dulu.")
+            return
+        path = filedialog.askopenfilename(
+            title=f"Model untuk S{self._slot}",
+            filetypes=[("Model YOLO", "*.pt *.onnx *.engine *.torchscript"),
+                       ("Semua file", "*.*")])
+        if not path:
+            return
+        s.model = str(path)
+        self._sources_changed()
+        self._refresh()
+        self._say(f"S{self._slot}: model {Path(path).name}")
+
+    def _clear_model(self):
+        s = self.cfg.sources.get(self._slot)
+        if s is None or not s.model:
+            return
+        cfg, slot = self.cfg, self._slot
+        n = len(cfg.rois_of(slot))
+        if n and not messagebox.askyesno(
+                "Tanpa model",
+                f"S{slot} tidak akan punya model, jadi {n} ROI-nya ikut dihapus. Lanjutkan?"):
+            return
+        if cfg.input and cfg.input.source == slot:
+            cfg.input = None
+        if cfg.output and cfg.output.source == slot:
+            cfg.output = None
+        cfg.sequence = [r for r in cfg.sequence if r.source != slot]
+        s.model = ""
+        self._sel_id = None
+        self._sources_changed()
+        self._refresh()
 
     def _refresh_tree(self):
         self._syncing = True
@@ -1271,16 +1545,16 @@ class LogicEditorPanel(ttk.Frame):
             cfg = self.cfg
             if cfg.input:
                 self.tree.insert("", "end", iid=cfg.input.id, tags=("input",),
-                                 values=("IN", "input", "Ambil barang", f"{cfg.input.conf:.2f}",
-                                         self._chk_text(cfg.input.id)))
+                                 values=("IN", f"S{cfg.input.source}", "input", "Ambil barang",
+                                         f"{cfg.input.conf:.2f}", self._chk_text(cfg.input.id)))
             for i, r in enumerate(cfg.sequence, 1):
                 self.tree.insert("", "end", iid=r.id, tags=(r.tag,),
-                                 values=(i, r.tag, r.description, f"{r.conf:.2f}",
-                                         self._chk_text(r.id)))
+                                 values=(i, f"S{r.source}", r.tag, r.description,
+                                         f"{r.conf:.2f}", self._chk_text(r.id)))
             if cfg.output:
                 self.tree.insert("", "end", iid=cfg.output.id, tags=("output",),
-                                 values=("OUT", "output", "Taruh barang", f"{cfg.output.conf:.2f}",
-                                         self._chk_text(cfg.output.id)))
+                                 values=("OUT", f"S{cfg.output.source}", "output", "Taruh barang",
+                                         f"{cfg.output.conf:.2f}", self._chk_text(cfg.output.id)))
             if self._sel_id and self.tree.exists(self._sel_id):
                 self.tree.selection_set(self._sel_id)
             else:
@@ -1503,12 +1777,9 @@ class LogicEditorPanel(ttk.Frame):
         ttk.Button(btns, text="Batal", command=top.destroy).pack(side="right", padx=(0, 6))
         top.wait_window()
 
-    def save(self) -> bool:
-        fw, fh = self.get_frame_size()
-        if fw and fh:
-            self.cfg.frame_w, self.cfg.frame_h = fw, fh
-            self.cfg.mirror = bool(self.get_mirror())
-        errors, warnings = validate(self.cfg, (fw, fh))
+    def save(self, path=None) -> bool:
+        target = Path(path) if path else self.xml_path
+        errors, warnings = validate(self.cfg)
         if errors:
             messagebox.showerror("Simpan gagal", "\n".join(f"• {e}" for e in errors))
             return False
@@ -1516,17 +1787,33 @@ class LogicEditorPanel(ttk.Frame):
                 "Peringatan", "\n".join(f"• {w}" for w in warnings) + "\n\nTetap simpan?"):
             return False
         try:
-            save_logic_xml(self.xml_path, self.cfg)
+            save_logic_xml(target, self.cfg)
         except Exception as e:
             messagebox.showerror("Simpan gagal", str(e))
             return False
+        self.xml_path = target          # file aktif = file yang baru disimpan
         self._dirty = False
         self._refresh()
-        self._say(f"Tersimpan: {self.xml_path.name} "
-                  f"({len(self.cfg.sequence)} sequence ROI)")
+        self._say(f"Tersimpan: {target.name} ({len(self.cfg.sequence)} sequence ROI)")
         if self.on_saved:
             self.on_saved(self.xml_path)
         return True
+
+    def save_as(self) -> bool:
+        errors, _ = validate(self.cfg)
+        if errors:
+            messagebox.showerror("Simpan gagal", "\n".join(f"• {e}" for e in errors))
+            return False
+        path = filedialog.asksaveasfilename(
+            parent=self.winfo_toplevel(),
+            title="Simpan logic_config sebagai",
+            initialdir=str(self.xml_path.parent),
+            initialfile=self.xml_path.name,
+            defaultextension=".xml",
+            filetypes=[("XML", "*.xml"), ("All", "*.*")])
+        if not path:
+            return False
+        return self.save(path)
 
     def load(self, path=None, silent=False) -> bool:
         path = Path(path) if path else self.xml_path
@@ -1541,10 +1828,11 @@ class LogicEditorPanel(ttk.Frame):
                 messagebox.showerror("Muat gagal", str(e))
             return False
         self.cfg = cfg
-        self._sel_id = None
+        self.xml_path = path            # <-- tambahkan: Simpan berikutnya menimpa file ini
         self._dirty = False
-        self._sync_to_frame()
-        self._refresh()
+        if self.on_sources_changed:
+            self.on_sources_changed(cfg.sources)
+        self._activate(1)
         self._say(f"Dimuat: {path.name}")
         return True
 
@@ -1568,7 +1856,7 @@ class LogicEditorPanel(ttk.Frame):
         if not self._attached:
             return frame
         seq_no = {r.id: i for i, r in enumerate(self.cfg.sequence, 1)}
-        for r in self.cfg.all_rois():
+        for r in self.cfg.rois_of(self._slot):
             x1, y1, x2, y2 = self._to_prev(r.rect)
             color = self.COLORS[r.role if r.role != ROLE_SEQ else r.tag]
             sel = r.id == self._sel_id
@@ -1617,26 +1905,24 @@ def _run_standalone(args):
     root.geometry("1280x720")
 
     # ── State sumber, model, deteksi ──
-    src = {"cap": None, "still": None, "transport": None}
+
     size = {"w": 0, "h": 0}
     names = {i: c.strip() for i, c in enumerate(args.classes.split(",")) if c.strip()}
     det = {"model": None, "busy": False, "result": [], "key": None, "frame_no": 0, "t_last": 0.0,
            "seq": 0, "t": 0.0, "seen": -1}
     infer_queue = queue.Queue(maxsize=1)
     status = tk.StringVar(value="Siap")
-    video_var = tk.StringVar(value="Video: (belum dimuat)")
     model_var = tk.StringVar(value="Model: (belum dimuat)")
     det_on = tk.BooleanVar(value=True)
     det_conf = tk.DoubleVar(value=0.25)
     det_rate = tk.DoubleVar(value=7)
-    seq_on = tk.BooleanVar(value=True)
+    seq_on = tk.BooleanVar(value=False)
     seq_var = tk.StringVar(value="")
     tester = SequenceTester()
     # ── Toolbar atas ──
     toolbar = ttk.Frame(root)
     toolbar.pack(side="top", fill="x", padx=6, pady=(6, 0))
-    ttk.Button(toolbar, text="🎬 Load Video", command=lambda: ask_video()).pack(side="left", ipady=2)
-    ttk.Label(toolbar, textvariable=video_var, foreground="#555555").pack(side="left", padx=(8, 20))
+
     ttk.Button(toolbar, text="🧠 Load Model", command=lambda: ask_model()).pack(side="left", ipady=2)
     ttk.Label(toolbar, textvariable=model_var, foreground="#555555").pack(side="left", padx=(8, 20))
     ttk.Checkbutton(toolbar, text="Deteksi YOLO", variable=det_on,
@@ -1664,7 +1950,7 @@ def _run_standalone(args):
     container.pack(side="left", fill="both", expand=True, padx=6, pady=6)
     container.pack_propagate(False)
     preview = tk.Label(container, bg="black", fg="white",
-                       text="Klik “Load Video” untuk mulai")
+                       text="Klik ＋ Add Source untuk mulai")
     preview.pack(fill="both", expand=True)
     def get_local_monitor():
         pipe = tester.pipe
@@ -1681,6 +1967,52 @@ def _run_standalone(args):
             "msg": tester.render(),
             "wall": time.time(),
         }
+    caps = {}
+    failed = {}
+    active = {"slot": 1}
+
+    def release_slot(slot):
+        e = caps.pop(slot, None)
+        if e:
+            e["cap"].release()
+
+    def open_slot(slot):
+        s = panel.cfg.sources.get(slot)
+        if s is None:
+            return None
+        e = caps.get(slot)
+        if e and e["device"] == s.device:
+            return e
+        if time.time() - failed.get(slot, 0.0) < 2.0:
+            return None
+        release_slot(slot)
+        dev = s.device if s.kind == "video" else int(s.device)
+        cap = cv2.VideoCapture(dev)
+        if not cap.isOpened():
+            failed[slot] = time.time()
+            status.set(f"S{slot}: gagal membuka {s.device}")
+            return None
+        failed.pop(slot, None)
+        e = {"cap": cap, "device": s.device,
+             "transport": VideoTransport(cap) if s.kind == "video" else None}
+        caps[slot] = e
+        return e
+
+    def on_select(slot):
+        active["slot"] = slot
+        size["w"] = size["h"] = 0
+        det.update(result=[], key=None)
+        e = open_slot(slot)
+        panel.transport = e["transport"] if e else None
+        panel._tp_n = -1
+        status.set(f"Source aktif: S{slot}")
+
+    def on_sources_changed(sources):
+        for slot in list(caps):                  # slot bergeser / device berubah -> buka ulang
+            s = sources.get(slot)
+            if s is None or s.device != caps[slot]["device"]:
+                release_slot(slot)
+    
     panel = LogicEditorPanel(
         root, preview,
         get_frame_size=lambda: (size["w"], size["h"]),
@@ -1689,65 +2021,14 @@ def _run_standalone(args):
         xml_path=args.xml,
         on_close=root.destroy,
         set_status=status.set,
+        on_select_source=on_select,
+        on_sources_changed=on_sources_changed,
         get_live=get_local_monitor,
-        transport=None,
     )
     panel.pack(side="right", fill="y", padx=6, pady=6)
     panel.attach()
     root.protocol("WM_DELETE_WINDOW", lambda: root.destroy() if panel.confirm_close() else None)
-
     # ── Sumber ──
-    def release_source():
-        if src["cap"] is not None:
-            src["cap"].release()
-        src.update(cap=None, still=None, transport=None)
-        panel.transport = None
-        panel._tp_n = -1
-        size["w"] = size["h"] = 0
-        tester.reset()
-        det.update(result=[], key=None)
-
-    def set_video(path) -> bool:
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            messagebox.showerror("Load Video", f"Gagal membuka video:\n{path}")
-            return False
-        release_source()
-        src["cap"] = cap
-        src["transport"] = VideoTransport(cap)
-        panel.transport = src["transport"]
-        video_var.set(f"Video: {Path(path).name}")
-        status.set(f"Video dimuat: {Path(path).name}")
-        return True
-
-    def set_image(path) -> bool:
-        img = cv2.imread(str(path))
-        if img is None:
-            messagebox.showerror("Load Gambar", f"Gagal membaca gambar:\n{path}")
-            return False
-        release_source()
-        src["still"] = img
-        video_var.set(f"Gambar: {Path(path).name}")
-        return True
-
-    def set_camera(index) -> bool:
-        cap = cv2.VideoCapture(index)
-        if not cap.isOpened():
-            messagebox.showerror("Kamera", f"Gagal membuka kamera {index}.")
-            return False
-        release_source()
-        src["cap"] = cap
-        video_var.set(f"Kamera: {index}")
-        return True
-
-    def ask_video():
-        path = filedialog.askopenfilename(
-            title="Pilih video",
-            filetypes=[("Video", "*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm"),
-                       ("Semua file", "*.*")])
-        if path:
-            set_video(path)
-        root.focus_set()
 
     # ── Model ──
     def load_model(path) -> bool:
@@ -1812,36 +2093,19 @@ def _run_standalone(args):
             det["busy"] = False
 
 
-    def maybe_detect(frame_bgr):
+    def maybe_detect(frame_bgr, tp):
         if det["model"] is None or not det_on.get() or det["busy"]:
             return
-
-        tp = src["transport"]
-
         if tp is not None and tp.is_paused():
             key = ("v", tp.position(), round(det_conf.get(), 2))
-            if det["key"] == key:
-                return
-        elif src["still"] is not None:
-            key = ("i", round(det_conf.get(), 2))
             if det["key"] == key:
                 return
         else:
             key = None
             rate = det_rate.get()
-            if (
-                rate < 29.5
-                and time.perf_counter() - det["t_last"]
-                < 1.0 / max(1.0, rate)
-            ):
+            if rate < 29.5 and time.perf_counter() - det["t_last"] < 1.0 / max(1.0, rate):
                 return
-
-        tfr = (
-            tp.position() / tp.fps()
-            if tp is not None
-            else time.perf_counter()
-        )
-
+        tfr = tp.position() / tp.fps() if tp is not None else time.perf_counter()
         task = (
             frame_bgr.copy(),
             float(det_conf.get()),
@@ -1885,7 +2149,7 @@ def _run_standalone(args):
     worker_thread.start()
 
     def draw_detections(rgb, scale):
-        rois = panel.cfg.all_rois()
+        rois = panel.cfg.rois_of(active["slot"])
         hit_map = {d: n for d, n in tester.assign}
         for (x1, y1, x2, y2, name, cf) in det["result"]:
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
@@ -1913,12 +2177,10 @@ def _run_standalone(args):
     # ── Sumber dari argumen CLI (opsional) ──
     if args.model:
         load_model(args.model)
-    if args.image:
-        set_image(args.image)
-    elif args.video:
-        set_video(args.video)
+    if args.video:
+        panel.add_source("video", args.video)
     elif args.camera is not None:
-        set_camera(args.camera)
+        panel.add_source("camera", str(args.camera))
 
     # ── Loop tampilan ──
     last = {"t": time.perf_counter()}
@@ -1928,16 +2190,16 @@ def _run_standalone(args):
         now = time.perf_counter()
         dt, last["t"] = now - last["t"], now
 
-        tp = src["transport"]
+        slot = active["slot"]
+        e = open_slot(slot) if slot in panel.cfg.sources else None
+        tp = e["transport"] if e else None
         frame, key = None, None
-        if src["still"] is not None:
-            frame, key = src["still"], ("i",)
-        elif tp is not None:
+        if tp is not None:
             frame = tp.next_frame(dt)
             if tp.is_paused():
-                key = ("v", tp.position())
-        elif src["cap"] is not None:
-            ok, f = src["cap"].read()
+                key = ("v", slot, tp.position())
+        elif e is not None:
+            ok, f = e["cap"].read()
             frame = f if ok else None
 
         if frame is None:
@@ -1971,7 +2233,7 @@ def _run_standalone(args):
                 cache.update(key=None, frame=None, rgb=None)
                 rgb = base
 
-        maybe_detect(frame)                           # kirim ke thread YOLO
+        maybe_detect(frame, tp)                           # kirim ke thread YOLO
         if seq_on.get():
             now_t = tp.position() / tp.fps() if tp is not None else time.perf_counter()
             if tester.sync(panel.cfg):
@@ -1992,7 +2254,7 @@ def _run_standalone(args):
         rh, rw = rgb.shape[:2]
         off_x = max(0, (preview.winfo_width() - rw) // 2)
         off_y = max(0, (preview.winfo_height() - rh) // 2)
-        panel.set_view(rw, rh, w, h, off_x, off_y)
+        panel.set_view(rw, rh, w, h, off_x, off_y, slot=slot)
         if det_on.get() and det["model"] is not None:
             draw_detections(rgb, rw / w)
         rgb = panel.draw_on_frame(rgb)
@@ -2035,12 +2297,12 @@ def _run_standalone(args):
         root.after(33, tick)
     tick()
     root.mainloop()
-    release_source()
+    for s in list(caps):
+        release_slot(s)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Logic Editor — uji mandiri")
-    ap.add_argument("--image", help="(opsional) langsung buka gambar")
     ap.add_argument("--video", help="(opsional) langsung buka video")
     ap.add_argument("--camera", type=int, default=None, help="(opsional) index kamera")
     ap.add_argument("--model", help="(opsional) langsung muat model .pt")

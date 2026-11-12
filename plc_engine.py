@@ -190,6 +190,7 @@ class HitRule:
     min_overlap: float = 0.4        # untuk fraction / iou
     priority: int = 0
     group: str = ""                 # "" = tidak eksklusif
+    source: int = 0                 # 0 = cocok ke deteksi source mana pun
 
 
 def _inter(a: tuple, b: tuple) -> float:
@@ -234,6 +235,8 @@ def compute_bits(rules: list, dets: list, max_det=None, single: bool = False):
         box, name, cf = d[:4], d[4], d[5]
         cands = []
         for r in rules:
+            if r.source and len(d) > 6 and d[6] != r.source:
+                continue
             if r.classes and name not in r.classes:
                 continue
             if cf < r.conf:

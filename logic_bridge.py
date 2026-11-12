@@ -32,7 +32,8 @@ def _rules(cfg) -> list:
         out.append(HitRule(
             name=r.id, rect=tuple(r.rect), classes=set(r.classes), conf=float(r.conf),
             mode=_g(r, "mode", "center"), min_overlap=float(_g(r, "min_overlap", 0.4)),
-            priority=int(_g(r, "priority", 0)), group=_g(r, "group", "") or ""))
+            priority=int(_g(r, "priority", 0)), group=_g(r, "group", "") or "",
+            source=int(_g(r, "source", 0))))
     return out
 
 
@@ -96,9 +97,8 @@ def check_config(cfg):
     for a in range(len(rois)):
         for b in range(a + 1, len(rois)):
             ra, rb = rois[a], rois[b]
-            ga, gb = _g(ra, "group", ""), _g(rb, "group", "")
-            if ga and ga == gb:
-                continue
+            if _g(ra, "source", 0) != _g(rb, "source", 0):
+                continue                      # koordinat beda frame, tidak sebanding
             ov = _iou(ra.rect, rb.rect)
             if ov > 0.3:
                 warnings.append(f"ROI '{ra.id}' dan '{rb.id}' beririsan {ov:.0%} "
@@ -130,7 +130,8 @@ class SequenceTester:
         rows = [(r.id, r.role, tuple(r.rect), tuple(sorted(r.classes)), r.conf, r.tag,
                  r.description, _g(r, "mode", "center"), _g(r, "min_overlap", 0.4),
                  _g(r, "priority", 0), _g(r, "group", ""), _g(r, "dwell", 0.0),
-                 _g(r, "grace", 0.0)) for r in cfg.all_rois()]
+                 _g(r, "grace", 0.0), _g(r, "source", 0)) for r in cfg.all_rois()]
+                 
         return repr((rows, _g(cfg, "skip_mode", "immediate"), _g(cfg, "restart_on_input", False),
                      _g(cfg, "single", False), _g(cfg, "max_det", 0), _g(cfg, "program", "")))
 

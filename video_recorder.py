@@ -33,6 +33,7 @@ import threading
 import time
 import urllib.request as _ur
 from collections import deque
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -98,6 +99,49 @@ def _fit_duration(src: Path, target: float) -> float:
     return actual
 
 
+# ── Metadata layout tile di dalam file mp4 ────────────────────────────────────
+# Satu video = satu kanvas tile. Posisi tiap source disimpan di tag "comment" mp4:
+#   {"canvas":[w,h],"tiles":[{"slot":1,"rect":[x,y,w,h]}, ...]}   (rect ternormalisasi 0..1)
+# Ikut file, jadi tidak ada sidecar yang bisa yatim dan tidak terkait siklus/DB.
+
+def _rate_k(width: int, height: int, fps: float) -> int:
+    """maxrate (kbps): minimal 1M, naik bila kanvas lebih besar supaya resolusi native tidak blok."""
+    floor = int(_MAXRATE.rstrip("Mm")) * 1000
+    return max(floor, int(width * height * fps * _BPP / 1000))
+
+
+def _layout_tag(layout) -> str:
+    if not layout or not layout.get("tiles"):
+        return ""
+    return _json.dumps({"canvas": layout["canvas"], "tiles": layout["tiles"]},
+                       separators=(",", ":"))
+
+
+@lru_cache(maxsize=256)
+def _read_layout_cached(path: str, mtime_ns: int):
+    if not _FFPROBE:
+        return None
+    try:
+        r = subprocess.run(
+            [_FFPROBE, "-v", "error", "-show_entries", "format_tags=comment",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=10)
+        tag = (_json.loads(r.stdout).get("format", {}).get("tags", {}) or {}).get("comment")
+        lay = _json.loads(tag) if tag else None
+        return lay if isinstance(lay, dict) and lay.get("tiles") else None
+    except Exception:
+        return None
+
+
+def read_layout(path):
+    """Baca layout tile dari file video; None bila tidak ada (video lama / bukan dari tile)."""
+    p = Path(path)
+    try:
+        return _read_layout_cached(str(p), p.stat().st_mtime_ns)
+    except OSError:
+        return None
+
+
 # ── Folder & konstanta ────────────────────────────────────────────────────────
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -105,7 +149,8 @@ _FPS = 24
 _CODEC = "libx265"
 _PRESET = "fast"
 _CRF = "27"
-_MAXRATE = "1M"
+_MAXRATE = "1M"           # batas bawah; bitrate naik mengikuti jumlah piksel (lihat _rate_k)
+_BPP = 0.05               # bit per piksel per frame untuk batas bitrate
 _BUFSIZE = "2M"
 _END = object()
 
@@ -249,20 +294,25 @@ class VideoRecorder:
     def recording(self) -> bool:
         return self._cur is not None
 
-    def start_cycle(self, start_ts: Optional[float] = None):
+    def start_cycle(self, start_ts: Optional[float] = None, layout: Optional[dict] = None):
+        """layout: hasil tile_view.layout_meta(slots); ditulis ke metadata mp4."""
         start_ts = start_ts or time.time()
         with self._lock:
             if self._cur is not None:                  # pengaman
                 old, self._cur = self._cur, None
                 threading.Thread(target=self._abort, args=(old,), daemon=True).start()
-            tag = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            temp = TMP_DIR / f"_tmp_{self._prefix}_{tag}.mp4"
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            temp = TMP_DIR / f"_tmp_{self._prefix}_{stamp}.mp4"
             extra = ["-tag:v", "hvc1"] if self.codec == "libx265" else []
+            tag = _layout_tag(layout)
+            rate_k = _rate_k(self.frame_width, self.frame_height, self.fps)
+            if tag:
+                extra += ["-metadata", f"comment={tag}"]
             cmd = [_FFMPEG, "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
                    "-s", f"{self.frame_width}x{self.frame_height}",
                    "-pix_fmt", "bgr24", "-r", str(self.fps), "-i", "-",
                    "-c:v", self.codec, "-crf", _CRF, "-preset", _PRESET,
-                   "-maxrate", _MAXRATE, "-bufsize", _BUFSIZE,
+                   "-maxrate", f"{rate_k}k", "-bufsize", f"{rate_k * 2}k",
                    "-pix_fmt", "yuv420p", *extra, "-movflags", "+faststart",
                    str(temp)]
             s = _Session(cmd, temp, start_ts, self.fps)
