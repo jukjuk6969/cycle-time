@@ -97,8 +97,7 @@ function applyRange(ps, { from = null, to = null, shift = null } = {}) {
 }
 
 const CYCLE_COLS =
-  "cycle_count, cycle_time_sec, start_timestamp, end_timestamp, is_anomaly, anomaly_type, is_genesis, is_buffered, operator_id, video_filename, anomaly_label, skipped_expected";
-
+  "cycle_count, cycle_time_sec, start_timestamp, end_timestamp, is_anomaly, anomaly_type, is_genesis, is_buffered, operator_id, video_filename, anomaly_label, skipped_expected, target_limit_sec, short_limit_sec";
 async function getRecentInRange(line, station_id, opts = {}, limit = 100) {
   const p = await getPool();
   const n = Math.min(Math.max(parseInt(limit) || 100, 1), 1000);
@@ -150,7 +149,11 @@ function resolveAnomalyType(data) {
   return data.target_cycle_time > 0 && data.cycle_time_sec > data.target_cycle_time
     ? "LONG" : "OK";
 }
-
+function classifyByLimits(ct, target, short) {
+  if (target > 0 && ct > target) return "LONG";
+  if (short > 0 && ct < short) return "SHORT";
+  return "OK";
+}
 async function insertCycleTime(data) {
   const p = await getPool();
   if (!Number.isInteger(Number(data.line)) || !Number.isInteger(Number(data.station_id)))
@@ -209,18 +212,18 @@ async function insertCycleTime(data) {
 }
 
 // ── upsertHeartbeat ───────────────────────────────────────────────────────────
-async function upsertHeartbeat(line, station_id, state, elapsed_sec) {
-  const p = await getPool();
-  await p.query(
-    `INSERT INTO heartbeats (line, station_id, state, elapsed_sec, updated_at)
-     VALUES ($1, $2, $3, $4, timezone('UTC', now()))
-     ON CONFLICT (line, station_id) DO UPDATE
-       SET state = EXCLUDED.state,
-           elapsed_sec = EXCLUDED.elapsed_sec,
-           updated_at = EXCLUDED.updated_at`,
-    [line, station_id, state, elapsed_sec ?? null]
-  );
-}
+// async function upsertHeartbeat(line, station_id, state, elapsed_sec) {
+//   const p = await getPool();
+//   await p.query(
+//     `INSERT INTO heartbeats (line, station_id, state, elapsed_sec, updated_at)
+//      VALUES ($1, $2, $3, $4, timezone('UTC', now()))
+//      ON CONFLICT (line, station_id) DO UPDATE
+//        SET state = EXCLUDED.state,
+//            elapsed_sec = EXCLUDED.elapsed_sec,
+//            updated_at = EXCLUDED.updated_at`,
+//     [line, station_id, state, elapsed_sec ?? null]
+//   );
+// }
 
 async function getStationSummary() {
   const p = await getPool();
@@ -461,20 +464,23 @@ async function attachVideo(data) {
   const r = await p.query(
     `UPDATE cycle_times
      SET video_filename = $4, video_size_mb = $5,
-         video_recorded_at = $6, video_label = $7
+         video_recorded_at = $6, video_label = $7, video_type = $8
      WHERE line = $1 AND station_id = $2
        AND end_timestamp = $3 AND video_filename IS NULL`,
     [Number(data.line), Number(data.station_id),
      new Date(Number(data.end_timestamp) * 1000),
-     vp.filename, vp.size_mb, vp.recorded_at, vp.label]);
+     vp.filename, vp.size_mb, vp.recorded_at, vp.label,
+     data.video_type || null]);
   return r.rowCount;
 }
-
 const VIDEO_SELECT = `
   video_filename AS id, station_id, line, video_filename AS filename,
   video_size_mb AS size_mb, cycle_time_sec, is_anomaly, anomaly_type,
   video_label AS label, is_genesis, is_buffered, video_recorded_at AS recorded_at,
-  anomaly_label, skipped_expected`;
+  anomaly_label, skipped_expected,
+  target_limit_sec, short_limit_sec,
+  COALESCE(video_type, CASE WHEN is_anomaly THEN 'anomaly' ELSE 'normal' END) AS video_type`;
+
 const VIDEO_SORT = {
   time: "COALESCE(video_recorded_at, end_timestamp)",
   ct: "cycle_time_sec",
@@ -546,7 +552,8 @@ async function getVideos({
 async function getVideoByFilename(filename) {
   const p = await getPool();
   const r = await p.query(
-    `SELECT video_filename AS filename, is_anomaly, line, station_id
+    `SELECT video_filename AS filename, is_anomaly, line, station_id,
+            COALESCE(video_type, CASE WHEN is_anomaly THEN 'anomaly' ELSE 'normal' END) AS video_type
      FROM cycle_times WHERE video_filename = $1 LIMIT 1`,
     [String(filename)]);
   return r.rows[0] || null;
@@ -615,6 +622,7 @@ async function insertCyclesBatch(rows) {
       cmp: !!r.is_complete, anom: !!r.is_anomaly, atype: r.anomaly_type,
       gen: !!r.is_genesis, buf: !!r.is_buffered,
       tl: r.target_limit_sec ?? null, sl: r.short_limit_sec ?? null,
+      vt: r.video_type ?? null,
       vfn: v.filename ?? null, vsz: v.size_mb ?? null,
       vra: dtStr(v.recorded_at), vlb: v.label ?? null,
       sx: r.skipped_expected || null, al: r.anomaly_label || null,
@@ -640,14 +648,14 @@ async function insertCyclesBatch(rows) {
         (station_id, line, operator_id, cycle_time_sec, start_timestamp, end_timestamp,
          is_complete, is_anomaly, anomaly_type, is_genesis, is_buffered, cycle_count,
          video_filename, video_size_mb, video_recorded_at, video_label,
-         target_limit_sec, short_limit_sec, skipped_expected, anomaly_label, created_at)
+         target_limit_sec, short_limit_sec, video_type, skipped_expected, anomaly_label, created_at)
        SELECT j.station_id, j.line, j.operator_id, j.ct, j.st, j.et,
               j.cmp, j.anom, j.atype, j.gen, j.buf, 0,
-              j.vfn, j.vsz, j.vra, j.vlb, j.tl, j.sl, j.sx, j.al, j.et
+              j.vfn, j.vsz, j.vra, j.vlb, j.tl, j.sl, j.vt, j.sx, j.al, j.et
        FROM json_to_recordset($1::json) AS j(
          line int, station_id int, operator_id varchar(100), ct double precision,
          st timestamp, et timestamp, cmp boolean, anom boolean, atype varchar(10),
-         gen boolean, buf boolean, tl double precision, sl double precision,
+         gen boolean, buf boolean, tl double precision, sl double precision, vt varchar(10),
          vfn varchar(260), vsz double precision, vra timestamp, vlb varchar(50),
          sx varchar(500), al varchar(300))
        ON CONFLICT (line, station_id, end_timestamp) DO NOTHING
@@ -693,7 +701,7 @@ async function insertCyclesBatch(rows) {
 module.exports = {
   getPool,
   insertCycleTime,
-  upsertHeartbeat,
+  //upsertHeartbeat,
   getVideos,
   getStationSummary,
   getRecentCycles,
@@ -709,6 +717,6 @@ module.exports = {
   getFdStatus,
   getRecordedFilenames,
   markFdOffline,
-  shiftRange, prodDayRange, resolveAnomalyType, videoParams,
+  shiftRange, prodDayRange, resolveAnomalyType, classifyByLimits, videoParams,
   insertCyclesBatch,
 };

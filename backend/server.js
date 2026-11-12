@@ -64,23 +64,8 @@ const allowedOrigins = (process.env.CORS_ORIGINS || "")
   .map(s => s.trim())
   .filter(Boolean);
 
-const HB_DB_MIN_MS = 15_000;
 const hbState = new Map();   // "line-station" -> status terakhir
 const hbDirty = new Set();   // stasiun yang berubah sejak tick terakhir
-
-function writeHbToDb(h) {
-  if (h.closed) return;
-  if (h.dbBusy) { h.dbPending = true; return; }
-  h.dbBusy = true;
-  h.dbPending = false;
-  h.dbAt = Date.now();
-  h.inflight = db.upsertHeartbeat(h.line, h.station_id, h.state, h.elapsed_sec ?? null)
-    .catch((e) => console.error("[hb db]", e.message))
-    .finally(() => {
-      h.dbBusy = false;
-      if (h.dbPending && !h.closed) writeHbToDb(h);
-    });
-}
 
 function emitHb(h) {
   emitLine(h.line, "heartbeat", {
@@ -94,13 +79,11 @@ function pushState(line, station_id, { state, elapsed_sec, roi_idle_sec }) {
   const key = `${line}-${station_id}`;
   let h = hbState.get(key);
   if (!h) {
-    h = { line, station_id, state: null, dbAt: 0, dbBusy: false, dbPending: false, closed: false };
+    h = { line, station_id, state: null, closed: false };
     hbState.set(key, h);
   }
   const changed = h.state !== state;
   h.state = state; h.elapsed_sec = elapsed_sec; h.roi_idle_sec = roi_idle_sec;
-
-  if (changed || Date.now() - h.dbAt >= HB_DB_MIN_MS) writeHbToDb(h);
 
   if (changed) { hbDirty.delete(key); emitHb(h); }   // perubahan state: langsung
   else hbDirty.add(key);                              // selain itu: tunggu tick
@@ -127,34 +110,28 @@ setInterval(() => {
   for (const [l, rows] of byLine) io.to(`line:${l}`).volatile.emit("heartbeat_batch", rows);   // dashboard per line
 }, 1000);
 
-async function clearHb(line, station_id) {
+function clearHb(line, station_id) {
   const key = `${line}-${station_id}`;
   const h = hbState.get(key);
   if (!h) return;
   h.closed = true;
   hbDirty.delete(key);
   hbState.delete(key);
-  await h.inflight;      // tunggu tulis yang sedang jalan selesai, baru OFFLINE
 }
-
 async function finalizeOffline(key, gen, line, station_id) {
   const cur = sessions.get(key);
   if (!cur || cur.gen !== gen) return;        // sudah ada sesi baru, batalkan
 
   sessions.delete(key);
   engine.markDirty(line, station_id);
-  const clearing = clearHb(line, station_id); // bagian sinkronnya jalan sekarang, sebelum ada await lain
+  clearHb(line, station_id);
 
   emitLine(line, "fd_status", { line, station_id, online: false });
   emitLine(line, "heartbeat", { line, station_id, state: "OFFLINE", elapsed_sec: null, roi_idle_sec: null });
   log(`[FD-HB] offline L${line} ST${station_id}`);
 
   try {
-    await clearing;
-    if (sessions.has(key)) return;            // reconnect saat menunggu inflight
     await db.markFdOffline(line, station_id);
-    if (sessions.has(key)) return;            // cek lagi setelah await
-    await db.upsertHeartbeat(line, station_id, "OFFLINE", null);
   } catch (e) {
     console.error("[FD-HB close]", e.message);
   }
@@ -381,6 +358,7 @@ app.post('/api/fd/register', async (req, res) => {
       short_anomaly_sec: station.short_anomaly_sec ?? null,
       ip, port,
       hostname: hostname || station.hostname || null,
+      hb_port: HB_PORT,
     });
   } catch (e) {
     console.error('[FD] Register error:', e.message);
@@ -816,12 +794,9 @@ async function enterSaving(line, station_id) {
   engine.markDirty(line, station_id);
   for (const stop of [...(liveStreams.get(key) || [])]) stop();
   liveStreams.delete(key);
-  await clearHb(line, station_id);             // tunggu tulis yang sedang jalan selesai
-  if (!savingKeys.has(key)) return;            // hello datang saat menunggu: batalkan
+  clearHb(line, station_id);
   emitLine(line, "fd_status", { line, station_id, online: true, saving: true });
   emitLine(line, "heartbeat", { line, station_id, state: "SAVING_MODE", elapsed_sec: null, roi_idle_sec: null });
-  try { await db.upsertHeartbeat(line, station_id, "SAVING_MODE", null); }
-  catch (e) { console.error("[saving db]", e.message); }
   log(`[SAVING] masuk L${line} ST${station_id}`);
 }
 
@@ -984,7 +959,6 @@ app.post("/api/cycle", async (req, res) => {
       ? startTs
       : endTs - data.cycle_time_sec;
 
-    const anomaly_type = db.resolveAnomalyType(data);
     const skippedList = Array.isArray(data.skipped_expected)
       ? data.skipped_expected
           .map((x) => String(x?.description || x?.id || "").trim())
@@ -993,7 +967,24 @@ app.post("/api/cycle", async (req, res) => {
     const skipped_expected = skippedList.length ? skippedList.join("; ").slice(0, 500) : null;
     const lbl = String(data.anomaly_label || "").trim();
     const anomaly_label = lbl && lbl !== "OK" ? lbl.slice(0, 300) : null;
+
+    // Limit yang berlaku SAAT INI di server: satu sumber untuk status DAN snapshot.
+    const targetLimit = st.meta.target_cycle_time || null;
+    const shortLimit = st.meta.short_anomaly_sec || null;
+
+    // Klasifikasi FD hanya dipakai untuk menentukan folder video di FD.
+    const fdType = db.resolveAnomalyType(data);
+    const fdAnomaly = fdType !== "OK" || skippedList.length > 0;
+    const video_type = fdAnomaly ? "anomaly" : "normal";
+
+    // Status final ditentukan server. Genesis tetap mengikuti FD.
+    const anomaly_type = data.is_genesis
+      ? fdType
+      : db.classifyByLimits(data.cycle_time_sec, targetLimit, shortLimit);
     const is_anomaly = anomaly_type !== "OK" || skippedList.length > 0;
+
+    if (anomaly_type !== fdType)
+      log(`CYCLE L${line} ST${station_id}: FD=${fdType} server=${anomaly_type} ct=${data.cycle_time_sec} limit=${shortLimit ?? "-"}-${targetLimit ?? "-"}`);
 
     let reserved;
     try {
@@ -1007,7 +998,7 @@ app.post("/api/cycle", async (req, res) => {
     }
     if (!reserved) {
       if (data.video?.filename) {
-        db.attachVideo({ line, station_id, end_timestamp: endTs, video: data.video, label: data.label })
+        db.attachVideo({ line, station_id, end_timestamp: endTs, video: data.video, label: data.label, video_type })
           .then((n) => n && log(`VIDEO dipulihkan: ${data.video.filename}`))
           .catch((e) => console.error("[video recover]", e.message));
       }
@@ -1027,8 +1018,9 @@ app.post("/api/cycle", async (req, res) => {
       anomaly_label,
       is_genesis: data.is_genesis ? 1 : 0,
       is_buffered: data.is_buffered ? 1 : 0,
-      target_limit_sec: st.meta.target_cycle_time || null,   // baru
-      short_limit_sec: st.meta.short_anomaly_sec || null,    // baru
+      target_limit_sec: targetLimit,
+      short_limit_sec: shortLimit,
+      video_type,
       video: db.videoParams(data),
     };
 
@@ -1058,6 +1050,8 @@ app.post("/api/cycle", async (req, res) => {
       is_anomaly, anomaly_type,
       anomaly_label,
       skipped_expected,
+      target_limit_sec: targetLimit,
+      short_limit_sec: shortLimit,
       is_genesis: data.is_genesis,
       label: data.label,
       is_buffered: data.is_buffered,
@@ -1071,6 +1065,7 @@ app.post("/api/cycle", async (req, res) => {
     res.status(isDataErr ? 422 : 500).json({ error: err.message, code: err.code || undefined });
   }
 });
+
 app.post("/api/heartbeat", (req, res) => {
   const line = Number(req.body.line);
   const station_id = Number(req.body.station_id);
@@ -1278,7 +1273,7 @@ if (b.is_active !== undefined) next.is_active = !!b.is_active;
     log(`STATION UPDATE L${line} ST${sid}`);
     // supaya FD yang sedang jalan langsung ikut nilai baru
     if (taktChanged)
-      emitCfg(line, sid, "takt_time_update", { line, station_id: sid, takt_time: next.takt_time });
+      emitCfg(line, sid, "takt_time_update", { line, station_id: sid, takt_time: next.takt_time, target_cycle_time: next.takt_time });
     if (roiChanged)
       emitCfg(line, sid, "roi_timeout_update", { line, station_id: sid, roi_timeout_sec: next.roi_timeout_sec });
     await broadcastSummary();
@@ -1324,7 +1319,7 @@ app.put("/api/station/:line/:station/takt-time", async (req, res) => {
     if (!r.rowCount) return res.status(404).json({ error: `Station L${line}-ST${sid} tidak ditemukan` });
 
     log(`TAKT_TIME UPDATE L${line} ST${sid} → ${takt_time}s`);
-    emitCfg(line, sid, "takt_time_update", { line, station_id: sid, takt_time });
+    emitCfg(line, sid, "takt_time_update", { line, station_id: sid, takt_time, target_cycle_time: takt_time });
     await broadcastSummary();
     res.json({ ok: true, line, station_id: sid, takt_time });
   } catch (err) {
@@ -1501,13 +1496,12 @@ app.get("/api/video/:videoId/stream", videoLimit, async (req, res) => {
   try {
     const row = await db.getVideoByFilename(req.params.videoId);
     if (!row) return res.status(404).json({ error: "Video tidak ditemukan di DB" });
-    const { filename, is_anomaly, line, station_id } = row;
+    const { filename, video_type, line, station_id } = row;
     const addr = await getFdAddress(line, station_id);
     if (!addr)
       return res.status(503).json({ error: `FD L${line} ST${station_id} offline` });
 
-    const vtype = is_anomaly ? "anomaly" : "normal";
-    const fdPath = `/videos/${vtype}/${encodeURIComponent(filename)}`;
+    const fdPath = `/videos/${video_type}/${encodeURIComponent(filename)}`;
     const fdHost = new URL(addr);
     const reqHeaders = {};
     if (req.headers.range) reqHeaders["Range"] = req.headers.range;
@@ -1536,13 +1530,12 @@ app.get("/api/video/:videoId/download", videoLimit, async (req, res) => {
   try {
     const row = await db.getVideoByFilename(req.params.videoId);
     if (!row) return res.status(404).json({ error: "Video tidak ditemukan di DB" });
-    const { filename, is_anomaly, line, station_id } = row;
+    const { filename, video_type, line, station_id } = row;
     const addr = await getFdAddress(line, station_id);
     if (!addr)
       return res.status(503).json({ error: `FD L${line} ST${station_id} offline` });
-    const vtype = is_anomaly ? "anomaly" : "normal";
     const fdHost = new URL(addr);
-    const fdPath = `/videos/${vtype}/${encodeURIComponent(filename)}`;
+    const fdPath = `/videos/${video_type}/${encodeURIComponent(filename)}`;
 
     http.get({
       hostname: fdHost.hostname,
@@ -1570,9 +1563,9 @@ app.delete("/api/video/:videoId", async (req, res) => {
   try {
     const row = await db.getVideoByFilename(req.params.videoId);
     if (!row) return res.status(404).json({ error: "Video tidak ditemukan di DB" });
-    const { filename, is_anomaly, line, station_id } = row;
-    // Hanya boleh hapus anomaly
-    if (!is_anomaly)
+    const { filename, video_type, line, station_id } = row;
+    // Hanya boleh hapus video di folder anomaly
+    if (video_type !== "anomaly")
       return res.status(403).json({ error: "Hanya video anomaly yang boleh dihapus" });
 
     const addr = await getFdAddress(line, station_id);
