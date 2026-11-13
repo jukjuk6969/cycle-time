@@ -89,6 +89,102 @@ _hb_port: int = _HB_PORT
 _HB_INTERVAL = 10        # detik, heartbeat berkala (murah di socket)
 _hb_queue: "queue.Queue[dict]" = queue.Queue(maxsize=200)
 
+# --- Transport heartbeat/state: "tcp" (default) atau "udp" ---------------------------------
+# Hanya heartbeat + state yang boleh lewat UDP (toleran kehilangan paket).
+# Data siklus (HTTP) dan video (MJPEG/HTTP) tetap reliable dan TIDAK ikut berubah.
+_KEEP = object()                 # penanda "jangan ubah" untuk set_transport()
+_UDP_HB_INTERVAL = 5             # detik; lebih rapat dari TCP agar jendela 15s tahan 2 paket hilang
+_UDP_REPEAT = 3                  # state penting dikirim berulang (seq sama -> server buang duplikat)
+_UDP_CRITICAL = ("DISCARD", "CAMERA_OFFLINE", "COMPLETE")
+_transport: str = "tcp"
+_udp_hint = None                 # port UDP yang disarankan server (field udp_port saat register)
+_udp_port: int = _HB_PORT        # default: nomor sama dengan HB (ruang port TCP dan UDP terpisah)
+_udp_seq = 0
+_udp_attempt = 0
+
+
+def _read_setup_value(key, default=None):
+    try:
+        return json.loads(_SETUP_PATH.read_text(encoding="utf-8")).get(key, default)
+    except Exception:
+        return default
+
+
+def _update_setup(values: dict) -> bool:
+    """Gabungkan key ke setup_state.json secara atomik (key lain dipertahankan)."""
+    with _setup_lock:
+        try:
+            try:
+                d = json.loads(_SETUP_PATH.read_text(encoding="utf-8"))
+                if not isinstance(d, dict):
+                    d = {}
+            except Exception:
+                d = {}
+            d.update(values)
+            _SETUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _SETUP_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(d, indent=2), encoding="utf-8")
+            os.replace(tmp, _SETUP_PATH)
+            return True
+        except Exception as e:
+            logger.error(f"[SlaveAPI] Gagal simpan setup_state.json: {e}")
+            return False
+
+
+def _resolve_udp_port() -> int:
+    """Prioritas: override lokal (setup_state.json) > saran server > port HB."""
+    for cand in (_read_setup_value("hb_udp_port"), _udp_hint):
+        try:
+            p = int(cand)
+            if 1 <= p <= 65535:
+                return p
+        except (TypeError, ValueError):
+            pass
+    return _hb_port
+
+
+def get_transport() -> str:
+    return _transport
+
+
+def get_udp_port() -> int:
+    return _udp_port
+
+
+def get_udp_port_override() -> str:
+    v = _read_setup_value("hb_udp_port")
+    return "" if v in (None, "") else str(v)
+
+
+def set_transport(mode, udp_port=_KEEP) -> bool:
+    """mode: 'tcp' | 'udp'. udp_port: int = override, None = otomatis, (kosong) = tidak diubah."""
+    global _transport, _udp_port
+    mode = str(mode or "").strip().lower()
+    if mode not in ("tcp", "udp"):
+        return False
+    values = {"hb_transport": mode}
+    if udp_port is not _KEEP:
+        if udp_port is not None:
+            try:
+                udp_port = int(udp_port)
+            except (TypeError, ValueError):
+                return False
+            if not (1 <= udp_port <= 65535):
+                return False
+        values["hb_udp_port"] = udp_port
+    if not _update_setup(values):
+        return False
+    _transport = mode
+    _udp_port = _resolve_udp_port()
+    logger.info(f"[SlaveAPI] Transport heartbeat: {mode.upper()}"
+                + (f" (port UDP {_udp_port})" if mode == "udp" else ""))
+    return True
+
+
+_t0 = _read_setup_value("hb_transport", "tcp")
+_transport = _t0 if _t0 in ("tcp", "udp") else "tcp"
+_udp_port = _resolve_udp_port()
+
 def get_config() -> dict:
     if _station_config:
         return _station_config.copy()
@@ -155,8 +251,7 @@ def _get_local_ip() -> str:
         return "127.0.0.1"
 
 def _register_with_retry():
-    global _station_config
-    global _station_config, _hb_port
+    global _station_config, _hb_port, _udp_hint, _udp_port
     payload = {
         "ip":       _get_local_ip(),
         "port":     _slave_port,
@@ -191,6 +286,8 @@ def _register_with_retry():
                 _hb_port = int(body.get("hb_port") or _HB_PORT)
             except (TypeError, ValueError):
                 _hb_port = _HB_PORT
+            _udp_hint = body.get("udp_port")          # opsional: server boleh menyarankan port UDP
+            _udp_port = _resolve_udp_port()
             logger.info(
                 f"[SlaveAPI] Registered — L{body['line']} ST{body['station_id']} "
                 f"| {body['name']} | takt={body['takt_time']}s"
@@ -232,9 +329,6 @@ def _hb_host() -> str:
     return _server_url.split("//")[-1].split(":")[0]
 
 
-def _hb_send(sock: socket.socket, msg: dict):
-    sock.sendall((json.dumps(msg) + "\n").encode())
-
 _hb_connected = threading.Event()
 
 def is_hb_connected() -> bool:
@@ -252,6 +346,9 @@ def _socket_heartbeat_loop():
     while True:
         if _saving.is_set():
             time.sleep(0.5)
+            continue
+        if _transport != "tcp":
+            _udp_session()
             continue
         sock = None
         stop = None
@@ -276,16 +373,16 @@ def _socket_heartbeat_loop():
                 "hostname": socket.gethostname(),
             })
             stop = threading.Event()
-            last_rx = [time.time()]
+            last_rx = [time.monotonic()]
             _hb_connected.clear()
             threading.Thread(target=_hb_reader, args=(sock, stop, last_rx), daemon=True).start()
 
             # tunggu ack dari reader (JANGAN recv di sini)
-            deadline = time.time() + 5
+            deadline = time.monotonic() + 5
             while not _hb_connected.is_set():
                 if stop.is_set():
                     raise ConnectionError("server menutup/menolak saat hello")
-                if time.time() > deadline:
+                if time.monotonic() > deadline:
                     raise ConnectionError("ack tidak diterima 5s")
                 time.sleep(0.05)
 
@@ -296,24 +393,27 @@ def _socket_heartbeat_loop():
                 try: _hb_queue.get_nowait()
                 except queue.Empty: break
 
-            last_hb = 0.0
+            last_hb = time.monotonic() - _HB_INTERVAL      # kirim hb pertama segera
             while not stop.is_set():
-                if _saving.is_set():          # BARU
+                if _saving.is_set() or _transport != "tcp":
                     break
                 try:
                     _hb_send(sock, _hb_queue.get(timeout=1.0))
                 except queue.Empty:
                     pass
 
-                if time.time() - last_rx[0] > 15:
+                if time.monotonic() - last_rx[0] > 15:
                     raise ConnectionError("server tidak menjawab > 15s")
 
-                now = time.time()
-                if now - last_hb >= _HB_INTERVAL:
+                mono = time.monotonic()
+                if mono - last_hb >= _HB_INTERVAL:
                     _hb_send(sock, {"type": "hb", "station_id": cfg["station_id"],
                                     "line": cfg["line"], "ip": _get_local_ip(),
-                                    "port": _slave_port, "ts": now})
-                    last_hb = now
+                                    "port": _slave_port, "ts": time.time()})   # ts tetap jam dinding
+                    last_hb = mono
+            if _transport != "tcp" and not _saving.is_set():
+                logger.info("[SlaveAPI] Transport diganti ke UDP: socket TCP ditutup")
+                continue
             if _saving.is_set():              # BARU: keluar tanpa log "putus"
                 logger.info("[SlaveAPI] Saving mode: heartbeat socket ditutup")
                 continue                      # blok finally menutup socket
@@ -321,6 +421,12 @@ def _socket_heartbeat_loop():
 
         except Exception as e:
             _hb_connected.clear()
+            if stop: stop.set()                 # hentikan reader dulu
+            if sock:
+                try:
+                    sock.close()                # tutup SEBELUM tidur
+                except Exception:
+                    pass
             attempt += 1
             wait = min(attempt * 1, 30)
             logger.warning(f"[SlaveAPI] Heartbeat socket putus: {e} — reconnect dalam {wait}s")
@@ -333,6 +439,140 @@ def _socket_heartbeat_loop():
                     sock.close()
                 except Exception:
                     pass
+
+def _udp_open():
+    """Socket UDP. Family (IPv4/IPv6) mengikuti hasil resolve host server."""
+    infos = socket.getaddrinfo(_hb_host(), _udp_port, type=socket.SOCK_DGRAM)
+    fam, kind, proto, _canon, addr = infos[0]
+    s = socket.socket(fam, kind, proto)
+    s.settimeout(1.0)
+    s.connect(addr)          # UDP "connected": hanya menerima dari server, send() tanpa alamat
+    return s
+
+
+def _udp_send(sock, msg, repeat=1):
+    global _udp_seq
+    with _send_lock:
+        _udp_seq = (_udp_seq + 1) & 0x7FFFFFFF
+        out = dict(msg)
+        out["seq"] = _udp_seq
+        out["transport"] = "udp"
+        data = json.dumps(out, separators=(",", ":")).encode()
+        if len(data) > 1200:
+            logger.warning("[SlaveAPI] Paket UDP terlalu besar, dibuang")
+            return
+        for _ in range(repeat):
+            sock.send(data)
+
+
+def _udp_reader(sock, stop, last_rx):
+    while not stop.is_set():
+        try:
+            d = sock.recv(2048)
+        except socket.timeout:
+            continue
+        except ConnectionResetError:         # Windows: ICMP port-unreachable; biarkan timeout ack yang memutus
+            time.sleep(0.05)
+            continue
+        except OSError:
+            break
+        try:
+            msg = json.loads(d)
+        except ValueError:
+            continue
+        if not isinstance(msg, dict):
+            continue
+        last_rx[0] = time.monotonic()
+        t = msg.get("type")
+        if t == "ping":
+            try:
+                _udp_send(sock, {"type": "pong", "t": msg.get("t")})
+            except OSError:
+                pass
+        elif t == "ack":
+            _hb_connected.set()
+        elif t == "error":
+            logger.error(f"[HB-UDP] server menolak: {msg.get('error')}")
+            break
+    stop.set()
+
+
+def _udp_wait(seconds):
+    """Tidur yang terputus bila transport diganti / saving aktif."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end and _transport == "udp" and not _saving.is_set():
+        time.sleep(0.25)
+
+
+def _udp_session():
+    """
+    Satu sesi heartbeat via UDP: hello berulang sampai di-ack, lalu hb berkala + state dari antrean.
+    Kembali saat transport diganti / saving aktif / server diam (pemanggil mengulang).
+    Server WAJIB membalas {"type":"ack"} untuk hello DAN hb (itu satu-satunya tanda hidup di UDP).
+    """
+    global _udp_attempt
+    cfg = _station_config
+    sock = None
+    stop = threading.Event()
+    try:
+        sock = _udp_open()
+        last_rx = [time.monotonic()]
+        _hb_connected.clear()
+        threading.Thread(target=_udp_reader, args=(sock, stop, last_rx),
+                         daemon=True, name="fd-udp-rx").start()
+        hello = {"type": "hello", "station_id": cfg["station_id"], "line": cfg["line"],
+                 "ip": _get_local_ip(), "port": _slave_port, "hostname": socket.gethostname()}
+        deadline = time.monotonic() + 5
+        while not _hb_connected.is_set():
+            if stop.is_set():
+                raise ConnectionError("server menolak/menutup saat hello")
+            if time.monotonic() > deadline:
+                raise ConnectionError(f"ack UDP tidak diterima 5s (port {_udp_port})")
+            _udp_send(sock, hello)
+            _hb_connected.wait(1.0)
+
+        logger.info(f"[SlaveAPI] Heartbeat UDP terhubung ke {_hb_host()}:{_udp_port} "
+                    f"({sock.family.name})")
+        _udp_attempt = 0
+        while not _hb_queue.empty():              # buang state basi
+            try:
+                _hb_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        last_hb = time.monotonic() - _UDP_HB_INTERVAL
+        while not stop.is_set():
+            if _saving.is_set() or _transport != "udp":
+                logger.info("[SlaveAPI] Heartbeat UDP dihentikan (saving / ganti transport)")
+                return
+            try:
+                msg = _hb_queue.get(timeout=1.0)
+                crit = msg.get("state") in _UDP_CRITICAL
+                _udp_send(sock, msg, _UDP_REPEAT if crit else 1)
+            except queue.Empty:
+                pass
+            if time.monotonic() - last_rx[0] > 15:
+                raise ConnectionError("server tidak menjawab > 15s")
+            if time.monotonic() - last_hb >= _UDP_HB_INTERVAL:
+                _udp_send(sock, {"type": "hb", "station_id": cfg["station_id"],
+                                 "line": cfg["line"], "ip": _get_local_ip(),
+                                 "port": _slave_port, "ts": time.time()})
+                last_hb = time.monotonic()
+        raise ConnectionError("socket UDP ditutup")
+    except Exception as e:
+        _udp_attempt += 1
+        wait = min(_udp_attempt, 30)
+        logger.warning(f"[SlaveAPI] Heartbeat UDP putus: {e} - reconnect dalam {wait}s")
+        _udp_wait(wait)
+    finally:
+        _hb_connected.clear()
+        stop.set()
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
 
 _send_lock = threading.Lock()
 
@@ -358,7 +598,7 @@ def _hb_reader(sock, stop, last_rx):
                 msg = json.loads(line)
             except ValueError:
                 continue
-            last_rx[0] = time.time()
+            last_rx[0] = time.monotonic()
             t = msg.get("type")
             if t == "ping":
                 _hb_send(sock, {"type": "pong", "t": msg["t"]})
@@ -383,6 +623,24 @@ def health():
         "stream_ready": _latest_frame is not None,
         **usage,
     })
+@app.route("/transport", methods=["GET", "POST"])
+def transport():
+    if request.method == "GET":
+        return jsonify({"transport": _transport, "udp_port": _udp_port,
+                        "connected": _hb_connected.is_set()})
+    data = request.get_json(silent=True) or {}
+    mode = data.get("transport")
+    if mode not in ("tcp", "udp"):
+        return jsonify({"error": "transport harus 'tcp' atau 'udp'"}), 400
+    port = data["udp_port"] if "udp_port" in data else _KEEP
+    if port is not _KEEP and port is not None:
+        if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+            return jsonify({"error": "udp_port harus integer 1-65535 atau null"}), 400
+    if not set_transport(mode, port):
+        return jsonify({"error": "gagal menyimpan setup_state.json"}), 500
+    return jsonify({"ok": True, "transport": _transport, "udp_port": _udp_port})
+
+
 @app.route("/saving-mode", methods=["GET", "POST"])
 def saving_mode():
     if request.method == "GET":

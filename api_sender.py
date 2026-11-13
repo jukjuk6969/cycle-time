@@ -1,7 +1,8 @@
 """
 api_sender.py
 =============
-Mengirim data cycle time & heartbeat ke Node.js backend (server.js).
+Mengirim data cycle time ke Node.js backend (server.js).
+Heartbeat/state live dikirim lewat TCP socket di fd_slave_api.py (bukan lewat modul ini).
 
 Kontrak server (lihat server.js):
     POST /api/cycle      → 201 { ok, cycle_id, cycle_count }
@@ -19,9 +20,6 @@ Kontrak server (lihat server.js):
             }
         }
 
-    POST /api/heartbeat  → 200 { ok: true }
-        body: { station_id: int, state: str, elapsed_sec?: float }
-
 Fitur:
     - Retry otomatis dengan exponential backoff (HANYA untuk 5xx / timeout / network)
     - 4xx tidak di-retry dan tidak di-buffer (fatal — biasanya station_id salah)
@@ -38,7 +36,6 @@ import threading
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Optional
 
 from cycle_tracker import CycleResult
 
@@ -54,6 +51,11 @@ MAX_RETRY = 3
 RETRY_DELAY_BASE = 2.0      # exponential: 2s, 4s, 8s
 FLUSH_INTERVAL = 30.0       # detik antar flush buffer
 FLUSH_BATCH = 20            # maksimum record per flush
+
+# Batas ukuran tabel SQLite agar tidak membengkak tanpa batas.
+PENDING_MAX_ROWS = 5000                 # data siklus belum terkirim; lewat batas → yang terlama dibuang
+DEAD_MAX_ROWS = 1000                    # payload yang ditolak server
+DEAD_MAX_AGE_SEC = 30 * 24 * 3600       # simpan 30 hari
 
 # Status yang dianggap "sementara" → retry & buffer.
 # Selain ini (khususnya 4xx) → fatal, drop payload.
@@ -77,7 +79,6 @@ class ApiSender:
     ):
         self.base_url = base_url.rstrip("/")
         self.cycle_url = f"{self.base_url}/cycle"
-        self.heartbeat_url = f"{self.base_url}/heartbeat"
         self.timeout = timeout
 
         self._buffer_db = buffer_db
@@ -90,8 +91,7 @@ class ApiSender:
         self._flush_thread.start()
 
         logger.info(
-            f"[ApiSender] base_url={self.base_url} | "
-            f"cycle={self.cycle_url} | heartbeat={self.heartbeat_url}"
+            f"[ApiSender] base_url={self.base_url} | cycle={self.cycle_url}"
         )
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -131,26 +131,7 @@ class ApiSender:
             name=f"send-{result.station_id}-{int(result.end_timestamp)}",
         )
         t.start()
-    def send_heartbeat(self, station_id: int, state: str, elapsed: Optional[float]):
-        """
-        Kirim status live ke /api/heartbeat (non-blocking, best-effort).
-        Tidak di-buffer jika gagal — hanya dashboard yang kehilangan update.
-        """
-        line = self._line()
-        if line is None:
-            return
-        payload = {"line": line, "station_id": station_id, "state": state,
-                "elapsed_sec": round(elapsed, 2) if elapsed else None}
-        threading.Thread(
-            target=self._post_json,
-            args=(self.heartbeat_url, payload),
-            daemon=True,
-            name="heartbeat",
-        ).start()
-    @staticmethod
-    def _line():
-        from fd_slave_api import get_config
-        return get_config().get("line")
+
     @staticmethod
     def get_file_size(file_path: Path) -> dict:
         """
@@ -173,7 +154,6 @@ class ApiSender:
     def set_base_url(self, base_url: str):
         self.base_url = base_url.rstrip("/")
         self.cycle_url = f"{self.base_url}/cycle"
-        self.heartbeat_url = f"{self.base_url}/heartbeat"
 
     @staticmethod
     def _line():
@@ -364,6 +344,29 @@ class ApiSender:
         while True:
             time.sleep(FLUSH_INTERVAL)
             self._flush_buffer()
+            self._prune_buffer()
+
+    def _prune_buffer(self):
+        """Batasi ukuran tabel pending & dead."""
+        try:
+            with self._lock:
+                with sqlite3.connect(self._buffer_db) as conn:
+                    n = conn.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
+                    if n > PENDING_MAX_ROWS:
+                        drop = n - PENDING_MAX_ROWS
+                        conn.execute(
+                            "DELETE FROM pending WHERE id IN "
+                            "(SELECT id FROM pending ORDER BY id LIMIT ?)", (drop,))
+                        logger.error(
+                            f"[ApiSender] Buffer pending melewati {PENDING_MAX_ROWS}: "
+                            f"{drop} record TERLAMA dibuang (server down terlalu lama)")
+                    conn.execute("DELETE FROM dead WHERE created_at < ?",
+                                 (time.time() - DEAD_MAX_AGE_SEC,))
+                    conn.execute(
+                        "DELETE FROM dead WHERE id NOT IN "
+                        "(SELECT id FROM dead ORDER BY id DESC LIMIT ?)", (DEAD_MAX_ROWS,))
+        except Exception as e:
+            logger.error(f"[ApiSender] Prune buffer gagal: {e}")
 
     def _buffer_kill(self, row_id: int, payload_str: str, reason: str):
         """Pindahkan ke tabel dead (bisa dipulihkan), bukan hapus."""

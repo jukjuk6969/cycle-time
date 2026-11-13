@@ -6,7 +6,6 @@ import cv2
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
-from datetime import datetime
 import threading
 import time
 import os
@@ -26,12 +25,11 @@ import numpy as np
 import fd_slave_api
 import flask.cli
 flask.cli.show_server_banner = lambda *a, **k: None
-import ctypes
 import size_sync
 import csv
 import fd_auth
 from logic_editor import load_logic_xml, validate as validate_logic, LogicEditorPanel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import urllib.error
 from source_hub import SourceHub
 from tile_view import compose, canvas_size, fixed_cell, grid_for, layout_meta, rec_cell
@@ -45,7 +43,6 @@ except ImportError:
     YOLO_AVAILABLE = False
 
 from video_recorder import VideoRecorder
-from camera_manager import CameraManager
 from api_sender import ApiSender
 from storage_manager import StorageManager, VIDEOS_DIR
 from logic_cycle_engine import LogicCycleEngine
@@ -524,6 +521,7 @@ class YOLOInference:
         self._tracked_classes: set = set()
         self._engine: "LogicCycleEngine | None" = None
         self.on_cycle_aborted = None   # callback(reason: str)
+        self.engine_enabled = True
         self._pending = {}
         self._pend_lock = threading.Lock()
         self._wake = threading.Event()
@@ -822,6 +820,8 @@ class CTMonitorApp:
     def __init__(self, root: tk.Tk, args):
         self.root = root
         self.args = args
+        self._ui_q: queue.Queue = queue.Queue()   # harus ada sebelum self._ui() dipanggil
+        self._resync_busy = False
         self._logic_path: Path = LOGIC_CONFIG_PATH      # path aktif (bisa diganti lewat file picker)
         self.hub = SourceHub(self._on_source_frame)
         fd_slave_api.set_slot_source(self.hub.frame)
@@ -859,7 +859,6 @@ class CTMonitorApp:
         self.root.minsize(1, 1)
 
         # ── Kamera state ───────────────────────────────────────────────────
-        self.cap = None
         self.running = False
         self.recording = False
         self.record_start_time = None
@@ -871,18 +870,13 @@ class CTMonitorApp:
         self._latest_frame = None
         self._frame_w = 640
         self._frame_h = 480
-        self._capture_thread = None
         self._writer_thread = None
         self._write_queue = queue.Queue(maxsize=120)
-        self._measured_fps = None
-        self._fps_stable = False
-        self._actual_fps = 24.0
         self._paused = False
-        self._last_frame_ts = time.time()     # ← TAMBAH BARIS INI
 
         # ── YOLO ───────────────────────────────────────────────────────────
         self.yolo = YOLOInference()
-        self.yolo.on_models_changed = lambda: self.root.after(0, self._on_models_ready)
+        self.yolo.on_models_changed = lambda: self._ui(self._on_models_ready)
         self.yolo.set_engine(LogicCycleEngine())
         self._attach_cycle_callbacks()
         self.yolo.on_cycle_aborted = self._on_cycle_aborted
@@ -903,8 +897,6 @@ class CTMonitorApp:
         self._storage = None
         self._server_connected = True
         self._server_disconnected_since: float | None = None
-        self._last_heartbeat = time.time()
-        self._cycle_count = 0
 
         # ── Settings ───────────────────────────────────────────────────────
         self._settings_path = Path(__file__).parent / "config" / "ct_settings.json"
@@ -935,7 +927,6 @@ class CTMonitorApp:
         self._var_elapsed  = tk.StringVar(value="—")
         self._var_last_ct  = tk.StringVar(value="—")
         self._var_avg_ct   = tk.StringVar(value="—")
-        self._var_best_ct  = tk.StringVar(value="—")
         self._ct_history: list[float] = []
         self._var_takt     = tk.StringVar(value=f"{args.takt_time:.1f}s")
         self._var_anom_lim = tk.StringVar(value="—")
@@ -954,14 +945,6 @@ class CTMonitorApp:
         self._var_master_port = tk.StringVar(value=str(_u.port or DEFAULT_MASTER[1]))
         self._slave_base = None
 
-        self.camera_name_var = tk.StringVar(value="HD USB CAMERA")
-        self._camera_map = {
-            "HD USB CAMERA": 0,
-            "USB Camera 2": 1,
-            "OBS Virtual Camera": 2,
-        }
-        self.source_var = tk.StringVar(value="Kamera")
-        self.video_path_var = tk.StringVar(value="")
         self.width = tk.IntVar(value=640)
         self.height = tk.IntVar(value=480)
         self.fps = tk.IntVar(value=24)
@@ -973,7 +956,6 @@ class CTMonitorApp:
         self.folder_var = tk.StringVar(value=self.output_dir)
         self.photo_count_var = tk.StringVar(value="Foto: 0")
         self._photo_count = 0
-        self.model_path_var = tk.StringVar(value="")
         self.model_info_var = tk.StringVar(value="Belum ada source")
         self.conf_var = tk.DoubleVar(value=0.25)
         self._roi_min_conf = 1.0
@@ -995,8 +977,7 @@ class CTMonitorApp:
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
         self.mirror_var.trace_add("write", lambda *_: self.running and self._sync_sources())
         # Mulai koneksi server di background
-        # Antrean UI untuk thread background (aman dipakai sebelum mainloop)
-        self._ui_q: queue.Queue = queue.Queue()
+        # Antrean UI untuk thread background (dibuat di awal __init__)
         self._drain_ui_q()
 
         self.authenticated = False
@@ -1005,6 +986,7 @@ class CTMonitorApp:
             sys.exit(0)
         self.authenticated = True
         self._shift_tick()
+        threading.Thread(target=self._lag_watchdog, daemon=True, name='lag-watchdog').start()
         # Server baru dihubungi setelah login berhasil
         threading.Thread(target=self._init_server, daemon=True).start()
 
@@ -1026,6 +1008,25 @@ class CTMonitorApp:
         except queue.Empty:
             pass
         self.root.after(50, self._drain_ui_q)
+    def _on_transport_pick(self, _=None):
+        mode = self._transport_combo.get().strip().lower()
+        raw = self._udp_port_var.get().strip()
+        port = None
+        if raw:
+            try:
+                port = int(raw)
+                if not (1 <= port <= 65535):
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Transport", "Port UDP harus angka 1-65535 (kosong = otomatis).")
+                return
+        if not fd_slave_api.set_transport(mode, port):
+            messagebox.showerror("Transport", "Gagal menyimpan pengaturan transport.")
+            return
+        eff = f" (port UDP {fd_slave_api.get_udp_port()})" if mode == "udp" else ""
+        self.root_status.config(
+            text=f"Kirim status via {mode.upper()}{eff} - berlaku dalam beberapa detik")
+        logger.info(f"[Transport] {mode.upper()}{eff}")
     def _reconnect_server(self):
         if self._server_lock.locked():
             return
@@ -1090,13 +1091,13 @@ class CTMonitorApp:
 
         def work():
             r = size_sync.sync_sizes(base_url, force=True)
-            self.root.after(0, lambda: self.root_status.config(
+            self._ui(lambda: self.root_status.config(
                 text=f"Sync ukuran: {r['ok']} OK | {r['not_found']} belum ada di server | {r['failed']} gagal"))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _resync_held_videos(self):
-        if getattr(self, "_resync_busy", False):
+        if self._resync_busy:
             return
         if not (self.args.line and self.args.station_no):
             messagebox.showwarning("Sync Video", "Identitas stasiun belum diketahui.")
@@ -1150,8 +1151,8 @@ class CTMonitorApp:
                 known, off = set(), 0
                 while True:
                     q = (f"{base_url}/api/videos?line={line}&station_id={st}"
-                         f"&from={datetime.utcfromtimestamp(t0).isoformat()}Z"
-                         f"&to={datetime.utcfromtimestamp(t1).isoformat()}Z"
+                         f"&from={datetime.fromtimestamp(t0, tz=timezone.utc).replace(tzinfo=None).isoformat()}Z"
+                         f"&to={datetime.fromtimestamp(t1, tz=timezone.utc).replace(tzinfo=None).isoformat()}Z"
                          f"&limit=1000&offset={off}")
                     with _urllib.urlopen(q, timeout=10) as resp:
                         page = json.loads(resp.read())
@@ -1199,7 +1200,8 @@ class CTMonitorApp:
                         headers={"Content-Type": "application/json"}, method="POST")
                     try:
                         with _urllib.urlopen(req, timeout=8) as resp:
-                            res["sent"] += 1 if resp.status in (200, 201) else 0
+                            if resp.status in (200, 201):
+                                res["sent"] += 1
                     except urllib.error.HTTPError as e:
                         res["failed"] += 1
                         logger.warning(f"[Resync] {path.name}: HTTP {e.code}")
@@ -1526,11 +1528,7 @@ class CTMonitorApp:
             **old,
             "version": 3,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "model_path": self.model_path_var.get().strip(),
             "logic_path": str(self._logic_path),
-            "source": self.source_var.get(),
-            "camera_name": self.camera_name_var.get(),
-            "video_path": self.video_path_var.get().strip(),
             "width": self._var_int(self.width, 640),
             "height": self._var_int(self.height, 480),
             "fps": self._var_int(self.fps, 24),
@@ -1563,13 +1561,6 @@ class CTMonitorApp:
             logger.warning(f"[Setup] File setup rusak, diabaikan: {e}")
             return
 
-        # Model (load tetap manual: butuh identitas stasiun dari server)
-        mp = d.get("model_path", "")
-        if mp:
-            self.model_path_var.set(mp)
-            if not os.path.exists(mp):
-                logger.warning(f"[Setup] Model tidak ditemukan: {mp}")
-
         # File XML logic (dimuat sebelum _init_logic_engine dipanggil)
         lp = d.get("logic_path")
         if lp and Path(lp) != self._logic_path:
@@ -1584,13 +1575,7 @@ class CTMonitorApp:
             else:
                 logger.warning(f"[Setup] Logic XML tidak ditemukan: {p}")
 
-        # Kamera / video
-        if d.get("source") in ("Kamera", "Video File"):
-            self.source_var.set(d["source"])
-        if d.get("camera_name") in self._camera_map:
-            self.camera_name_var.set(d["camera_name"])
-        if d.get("video_path"):
-            self.video_path_var.set(d["video_path"])
+        # Resolusi / format
         for key, var in (("width", self.width), ("height", self.height), ("fps", self.fps)):
             v = d.get(key)
             if isinstance(v, int) and not isinstance(v, bool) and v > 0:
@@ -1762,7 +1747,7 @@ class CTMonitorApp:
             for e in errors:
                 logger.error(f"[Logic] {e}")
             self._var_logic.set("TIDAK VALID — lihat log")
-            self.root_status.config(text="logic_config.xml tidak valid — lihat log")
+            self.root_status.config(text=f"{self._logic_path.name} tidak valid - lihat log")
             return
         self.yolo.engine.set_config(cfg)
         self._adapted.clear()
@@ -1817,16 +1802,15 @@ class CTMonitorApp:
             parts += ["expected", ", ".join(d for _, d in skipped)]
         return "Anomaly+" + "+".join(parts) if parts else "OK"
     def _on_cycle_rejected(self, elapsed: float, min_ct: float):
-        """Dipanggil dari thread YOLO — semua yang menyentuh Tk lewat root.after."""
+        """Dipanggil dari thread YOLO — semua yang menyentuh Tk lewat self._ui()."""
         logger.warning(f"[Filter] Siklus {elapsed:.2f}s < min {min_ct:.1f}s — dibuang")
         self._logger.log("DISCARD", f"cycle terlalu cepat {elapsed:.2f}s < {min_ct:.1f}s")
         if self._ct_recorder:
             self._ct_recorder.discard()
-        self.root.after(
-            0,
+        self._ui(
             lambda: self._enter_discard(
                 f"siklus {elapsed:.1f}s < minimum {min_ct:.1f}s", hold=2.0
-            ),
+            )
         )
     def _on_cycle_start(self, ts=None):
         if self._ct_recorder and not self.args.no_record:
@@ -1932,14 +1916,13 @@ class CTMonitorApp:
                     },
                 )
 
-            self._cycle_count = cycle_num
-            self.root.after(
-                0, lambda: self._on_cycle_ui_update(
+            self._ui(
+                lambda: self._on_cycle_ui_update(
                     cycle_num, cycle_time, anom_type, is_genesis, skipped, label)
             )
-            self.root.after(0, self._show_complete)
-            self.root.after(
-                0, lambda: self.cycle_var.set(f"{cycle_num}  ({cycle_time:.1f}s)")
+            self._ui(self._show_complete)
+            self._ui(
+                lambda: self.cycle_var.set(f"{cycle_num}  ({cycle_time:.1f}s)")
             )
 
         except Exception as e:
@@ -2403,6 +2386,22 @@ class CTMonitorApp:
                 side="left", fill="x", expand=True, anchor="w"
             )
 
+        tr_row = ttk.Frame(box)
+        tr_row.pack(fill="x", pady=(0, 2))
+        ttk.Label(tr_row, text="Kirim status", width=12, anchor="w").pack(side="left")
+        self._transport_combo = ttk.Combobox(tr_row, state="readonly", width=5,
+                                             values=["TCP", "UDP"])
+        self._transport_combo.set(fd_slave_api.get_transport().upper())
+        self._transport_combo.pack(side="left")
+        self._transport_combo.bind("<<ComboboxSelected>>", self._on_transport_pick)
+        ttk.Label(tr_row, text="  Port UDP").pack(side="left")
+        self._udp_port_var = tk.StringVar(value=fd_slave_api.get_udp_port_override())
+        udp_entry = ttk.Entry(tr_row, textvariable=self._udp_port_var, width=6, justify="center")
+        udp_entry.pack(side="left")
+        udp_entry.bind("<Return>", self._on_transport_pick)
+        ttk.Label(box, text="Port UDP kosong = otomatis (saran server, lalu sama dengan port HB). "
+                            "UDP hanya untuk heartbeat/state; data siklus & video tetap HTTP.",
+                  foreground="#777777", wraplength=260).pack(anchor="w", pady=(0, 6))
         _row("Status",    self._var_server)
         _row("Takt Time", self._var_takt)
         _row("Timeout",   self._var_disc_lim)
@@ -2489,17 +2488,6 @@ class CTMonitorApp:
         self.root_status.config(
             text="Debug Mode ON — log di terminal dan file" if on
             else "Debug Mode OFF — semua log dimatikan")
-    def _set_timer(self, key: str, entry):        # ← tempel di sini
-        try:
-            v = float(entry.get().replace(",", "."))
-            if v <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Timer", "Isi angka detik > 0")
-            return
-        self._cfg[key] = v
-        save_settings(self._cfg, str(self._settings_path))
-        self.root_status.config(text=f"{key} = {v:.0f}s")
     def toggle_pause(self):
         """TEST MODE: bekukan preview, tapi timer cycle/discard tetap jalan."""
         self._paused = not self._paused
@@ -2577,6 +2565,8 @@ class CTMonitorApp:
         self._ct_history = self._ct_history[-50:]
         self._var_avg_ct.set(f"{sum(self._ct_history) / len(self._ct_history):.1f}s")
         tag = {"OK": "OK", "LONG": "ANOMALY", "SHORT": "SHORT ANOMALY"}[anom_type]
+        if skipped and anom_type == "OK":
+            tag = "ANOMALY (expected terlewat)"
         if is_genesis:
             tag += " | GENESIS"
         self.root_status.config(
@@ -2962,31 +2952,6 @@ class CTMonitorApp:
             except Exception as e:
                 logger.error(f"[Tile] compose error: {e}", exc_info=True)
 
-    def _on_source_change(self, *args):
-        if self.source_var.get() == "Video File":
-            self.cam_label.grid_remove()
-            self.cam_combo.grid_remove()
-            self.vid_label.grid()
-            self.vid_row.grid()
-            self.open_btn.config(text="Buka Video")
-        else:
-            self.vid_label.grid_remove()
-            self.vid_row.grid_remove()
-            self.cam_label.grid()
-            self.cam_combo.grid()
-            self.open_btn.config(text="Buka Kamera")
-
-    def _browse_video(self):
-        path = filedialog.askopenfilename(
-            title="Pilih file video",
-            filetypes=[
-                ("Video files", "*.mp4 *.avi *.mov *.mkv *.wmv"),
-                ("All", "*.*"),
-            ],
-        )
-        if path:
-            self.video_path_var.set(path)
-
     # ──────────────────────────────────────────────────────────────────────
     #  UI update loop
     # ──────────────────────────────────────────────────────────────────────
@@ -3051,7 +3016,7 @@ class CTMonitorApp:
                     else:
                         color, text = "#e53935", "TERPUTUS ✗"
                     self._server_indicator.config(fg=color)
-                    self._var_server.set(text)
+                    self._var_server.set(f"{text} [{fd_slave_api.get_transport().upper()}]")
                     self._var_takt.set(f"{self._takt.value:.1f}s")
                     self._var_anom_lim.set(f"{self._takt.anomaly_timer:.0f}")
                     self._var_disc_lim.set(f"{self._takt.discard_timeout:.0f}")
