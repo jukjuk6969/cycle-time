@@ -28,6 +28,7 @@ const db = require("./db");
 const auth = require("./auth");
 const os = require("os");
 const net = require("net");
+const dgram = require("dgram");
 const engine = require("./engine");
 async function broadcastSummary() { engine.emitSummary(io, await engine.refresh()); }
 
@@ -42,14 +43,19 @@ function emitCfg(line, station_id, ev, payload) {     // perubahan konfigurasi: 
 }
 
 const HB_PORT = portOf("HB_PORT", 2, 5002);
-const sessions = new Map();           // "line-station" -> { sock, gen, ip, offlineTimer }
+const sessions = new Map();           // "line-station" -> { sock, gen, ip, ... }  (TCP)
+const udpSessions = new Map();        // ← TAMBAH: "line-station" -> { line, station_id, ip, port, lastSeen, srtt, rttvar, state }
+const udpSeen    = new Map();         // ← TAMBAH: "line-station" -> { lastSeq }  — dedup by seq
 let genCounter = 0;
 const seenDirty = new Set();          // sesi yang perlu di-flush last_seen ke DB
 const savingKeys = new Set();         // "line-station" yang sedang saving mode
 const liveStreams = new Map();        // "line-station" -> Set<fungsi penghenti>
 const keyOf = (l, s) => `${Number(l)}-${Number(s)}`;
 const isSaving = (l, s) => savingKeys.has(keyOf(l, s));
-const isOnline = (l, s) => sessions.has(keyOf(l, s)) || savingKeys.has(keyOf(l, s));
+const isOnline = (l, s) => {
+  const k = keyOf(l, s);
+  return sessions.has(k) || udpSessions.has(k) || savingKeys.has(k);
+};
 engine.setDecorator((r) => {
   const on = isOnline(r.line, r.station_id);
   return { ...r, is_online: on, online: on, saving: isSaving(r.line, r.station_id) };
@@ -146,7 +152,9 @@ setInterval(async () => {
     const ips = [];
     for (const key of keys) {
       const s = sessions.get(key);
+      const u = udpSessions.get(key);     // ← TAMBAH
       if (s) ips.push(s.ip);
+      else if (u) ips.push(u.ip);         // ← TAMBAH
     }
     if (ips.length) {
       try { await db.updateFdSeenBatch(ips); }       // satu query per 500 stasiun, bukan satu per stasiun
@@ -158,28 +166,41 @@ setInterval(async () => {
 function fdStatusAll() {
   return engine.snapshotAll().map((s) => {
     const key = `${s.line}-${s.station_id}`;
-    const x = sessions.get(key);
+    const tcp = sessions.get(key);
+    const udp = udpSessions.get(key);
     const sv = savingKeys.has(key);
+    let state = "OFFLINE", rtt = null, transport = null;
+    if (tcp)      { state = tcp.state;            rtt = tcp.srtt; transport = "tcp"; }
+    else if (udp) { state = udp.state || "ONLINE"; rtt = udp.srtt; transport = "udp"; }
+    else if (sv)  { state = "SAVING_MODE";        transport = "saving"; }
     return {
       line: s.line, station_id: s.station_id,
-      online: !!x || sv, saving: sv,
-      state: x?.state ?? (sv ? "SAVING_MODE" : "OFFLINE"),
-      rtt: x?.srtt != null ? Math.round(x.srtt) : null,
+      online: !!tcp || !!udp || sv, saving: sv,
+      state, transport,
+      rtt: rtt != null ? Math.round(rtt) : null,
     };
   });
 }
-// cache hasil registry: saat server restart ratusan stasiun hello bersamaan; tanpa cache tiap hello = 2 query SQL
+
 const HELLO_TTL_MS = 30_000;
 const helloCache = new Map();         // "ip|port|host" -> { st, exp }
+const helloPending = new Map();       // ← TAMBAH: "ip|port|host" -> Promise<st>
 async function registerHello({ ip, port, hostname }) {
   const k = `${ip}|${port ?? ""}|${hostname ?? ""}`;
   const hit = helloCache.get(k);
   if (hit && hit.exp > Date.now()) return hit.st;
-  const st = await db.upsertFdRegistry({ ip, port, hostname });
-  helloCache.set(k, { st, exp: Date.now() + HELLO_TTL_MS });
-  if (helloCache.size > 5000) helloCache.clear();
-  return st;
+  if (helloPending.has(k)) return helloPending.get(k);
+  const p = db.upsertFdRegistry({ ip, port, hostname })
+    .then((st) => {
+      helloCache.set(k, { st, exp: Date.now() + HELLO_TTL_MS });
+      if (helloCache.size > 5000) helloCache.clear();
+      return st;
+    })
+    .finally(() => helloPending.delete(k));
+  helloPending.set(k, p);
+  return p;
 }
+
 const hbServer = net.createServer((sock) => {
   const remoteIp = String(sock.remoteAddress).replace(/^::ffff:/, "");
   let ident = null;                   // { line, station_id, key }
@@ -207,10 +228,15 @@ async function handleLine(line) {
     }
     const key = `${st.line}-${st.station_id}`;
     const prev = sessions.get(key);
-    const wasOnline = !!prev;
+    const udpPrev = udpSessions.get(key);                        // ← TAMBAH
+    const wasOnline = !!prev || !!udpPrev || savingKeys.has(key); // ← GANTI (dulu: !!prev saja)
     if (prev) {
       clearTimeout(prev.offlineTimer);
       if (prev.sock !== sock) { prev.sock._why = "replaced-by-new-hello"; prev.sock.destroy(); }
+    }
+    if (udpPrev) {                                               // ← TAMBAH: FD pindah UDP→TCP
+      udpSessions.delete(key);
+      udpSeen.delete(key);
     }
     sessions.set(key, {
       sock, gen: ++genCounter, ip: remoteIp, port: st.port,
@@ -218,7 +244,7 @@ async function handleLine(line) {
     });
     fdAddr.set(key, `http://${remoteIp}:${st.port}`);
     ident = { line: st.line, station_id: st.station_id, key };
-    const wasSaving = savingKeys.delete(key);   // hello = FD tidak saving (aturan emas)
+    const wasSaving = savingKeys.delete(key);
 
     sock.setTimeout(0);                       // phi menggantikan idle timeout
     sock.write(JSON.stringify({ type: "ack" }) + "\n");
@@ -262,6 +288,147 @@ async function handleLine(line) {
 
 hbServer.on("error", (e) => console.error("[FD-HB] listener error:", e.message));
 hbServer.listen(HB_PORT, "0.0.0.0", () => log(`FD heartbeat socket di port ${HB_PORT}`));
+
+// ═══════════════════════════════════════════════════════════════════════
+//  UDP heartbeat listener — paralel dengan TCP di port yang sama
+//  (TCP dan UDP punya namespace port terpisah → aman di HB_PORT)
+// ═══════════════════════════════════════════════════════════════════════
+const udpServer = dgram.createSocket("udp4");
+
+const udpSendAck = (rinfo) => {
+  try { udpServer.send(JSON.stringify({ type: "ack" }), rinfo.port, rinfo.address); } catch {}
+};
+const udpSendError = (rinfo, msg) => {
+  try { udpServer.send(JSON.stringify({ type: "error", error: String(msg) }), rinfo.port, rinfo.address); } catch {}
+};
+
+udpServer.on("message", async (buf, rinfo) => {
+  if (buf.length > 4096) return;
+  let msg;
+  try { msg = JSON.parse(buf.toString("utf8")); } catch { return; }
+  if (!msg || typeof msg !== "object" || typeof msg.type !== "string") return;
+
+  const remoteIp = String(rinfo.address).replace(/^::ffff:/, "");
+
+  // ───────────────────────────────────────────────────────────────
+  //  HELLO
+  // ───────────────────────────────────────────────────────────────
+  if (msg.type === "hello") {
+    let st;
+    try {
+      st = await registerHello({ ip: remoteIp, port: msg.port, hostname: msg.hostname });
+    } catch (e) {
+      log(`[FD-HB-UDP] ditolak ${remoteIp}: ${e.message}`);
+      return udpSendError(rinfo, e.message);
+    }
+
+    const key = keyOf(st.line, st.station_id);
+
+    // FD pindah transport TCP → UDP: putuskan sesi TCP lama tanpa memicu judge()
+    const tcpPrev = sessions.get(key);
+    if (tcpPrev) {
+      clearTimeout(tcpPrev.offlineTimer);
+      sessions.delete(key);                       // hapus dulu → close handler tidak judge()
+      try { tcpPrev.sock._why = "switched-to-udp"; tcpPrev.sock.destroy(); } catch {}
+    }
+    const wasOnline = !!tcpPrev || udpSessions.has(key) || savingKeys.has(key);
+    const wasSaving = savingKeys.delete(key);     // aturan emas: hello = tidak saving
+
+    const prevU = udpSessions.get(key);
+    udpSessions.set(key, {
+      line: st.line, station_id: st.station_id,
+      ip: remoteIp, port: rinfo.port,
+      lastSeen: Date.now(),
+      srtt:   prevU?.srtt   ?? null,
+      rttvar: prevU?.rttvar ?? null,
+      state:  "ONLINE",
+    });
+    udpSeen.set(key, { lastSeq: Number(msg.seq) || 0 });   // reset dedup (FD restart → seq mulai dari 0)
+    fdAddr.set(key, `http://${remoteIp}:${st.port}`);
+
+    udpSendAck(rinfo);                            // WAJIB: ack hello
+
+    if (!wasOnline || wasSaving) {
+      emitLine(st.line, "fd_status", {
+        line: st.line, station_id: st.station_id, online: true, saving: false,
+      });
+      engine.markDirty(st.line, st.station_id);
+    }
+    log(`[FD-HB-UDP] hello L${st.line} ST${st.station_id} ip=${remoteIp}:${rinfo.port}`
+      + (tcpPrev ? " (migrasi dari TCP)" : ""));
+    return;
+  }
+
+  // ───────────────────────────────────────────────────────────────
+  //  Pesan selain hello: cari sesi berdasarkan IP pengirim
+  // ───────────────────────────────────────────────────────────────
+  let key = null, us = null;
+  for (const [k, v] of udpSessions) {
+    if (v.ip === remoteIp) { key = k; us = v; break; }
+  }
+  if (!us) return;                                // belum hello / sesi sudah tutup → buang
+
+  // dedup by seq (state kritis dikirim 3× dengan seq sama)
+  const seq = Number(msg.seq);
+  const seen = udpSeen.get(key) || { lastSeq: 0 };
+  if (Number.isInteger(seq) && seq > 0 && seq <= seen.lastSeq) {
+    if (msg.type === "hb") udpSendAck(rinfo);     // tetap ack supaya FD tidak timeout
+    return;
+  }
+  if (Number.isInteger(seq) && seq > 0) udpSeen.set(key, { lastSeq: seq });
+
+  us.lastSeen = Date.now();
+  seenDirty.add(key);
+
+  if (msg.type === "hb") {
+    udpSendAck(rinfo);                            // ACK hb = satu-satunya tanda hidup di UDP
+    return;
+  }
+  if (msg.type === "pong") {
+    const rtt = Date.now() - Number(msg.t);
+    if (!Number.isFinite(rtt) || rtt < 0) return;
+    if (us.srtt == null) { us.srtt = rtt; us.rttvar = rtt / 2; }
+    else {
+      us.rttvar = 0.75 * us.rttvar + 0.25 * Math.abs(us.srtt - rtt);
+      us.srtt   = 0.875 * us.srtt + 0.125 * rtt;
+    }
+    return;
+  }
+  if (msg.type === "state") {
+    pushState(us.line, us.station_id, msg);
+    return;
+  }
+});
+
+udpServer.on("error", (e) => console.error("[FD-HB-UDP] listener error:", e.message));
+udpServer.bind(HB_PORT, "0.0.0.0", () => log(`FD heartbeat UDP di port ${HB_PORT}`));
+
+// ═══════════════════════════════════════════════════════════════════════
+//  UDP timeout sweep — UDP tidak punya event "close", jadi mati harus
+//  dideteksi via "tidak ada pesan selama 15s" (client kirim hb tiap 5s).
+// ═══════════════════════════════════════════════════════════════════════
+const UDP_TIMEOUT_MS = 15_000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, us] of udpSessions) {
+    if (now - us.lastSeen < UDP_TIMEOUT_MS) continue;
+    udpSessions.delete(key);
+    udpSeen.delete(key);
+    engine.markDirty(us.line, us.station_id);
+    clearHb(us.line, us.station_id);
+    emitLine(us.line, "fd_status", {
+      line: us.line, station_id: us.station_id, online: false,
+    });
+    emitLine(us.line, "heartbeat", {
+      line: us.line, station_id: us.station_id,
+      state: "OFFLINE", elapsed_sec: null, roi_idle_sec: null,
+    });
+    db.markFdOffline(us.line, us.station_id).catch(() => {});
+    log(`[FD-HB-UDP] offline L${us.line} ST${us.station_id} `
+      + `(no msg ${Math.round((now - us.lastSeen) / 1000)}s)`);
+  }
+}, 2000);
+
 const io = new Server(server, {
   cors: { origin: allowedOrigins, methods: ["GET", "POST"], credentials: true },
   transports: ["websocket"],        // lewati long-polling
@@ -300,7 +467,7 @@ setInterval(() => {
   const m = process.memoryUsage();
   const mb = (n) => (n / 1e6) | 0;
   log(`[perf] loop p99=${(loopH.percentile(99) / 1e6).toFixed(1)}ms queue=${engine.queueLength} ` +
-    `fd=${sessions.size} dash=${io.engine.clientsCount} live=${liveLimit.count()} vid=${videoLimit.count()} ` +
+    `fd=${sessions.size + udpSessions.size} (tcp=${sessions.size} udp=${udpSessions.size})dash=${io.engine.clientsCount} live=${liveLimit.count()} vid=${videoLimit.count()} ` +
     `rss=${mb(m.rss)}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB ` +
     `ext=${mb(m.external)}MB buf=${mb(m.arrayBuffers)}MB`);
   loopH.reset();
@@ -359,16 +526,25 @@ app.post('/api/fd/register', async (req, res) => {
       ip, port,
       hostname: hostname || station.hostname || null,
       hb_port: HB_PORT,
+      udp_port: HB_PORT,
     });
   } catch (e) {
     console.error('[FD] Register error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
-setInterval(() => {                       // ping, kirim ke semua sesi
+
+setInterval(() => {
   const t = Date.now();
+  const tcpLine = JSON.stringify({ type: "ping", t }) + "\n";
   for (const s of sessions.values())
-    if (!s.sock.destroyed) s.sock.write(JSON.stringify({ type: "ping", t }) + "\n");
+    if (!s.sock.destroyed) s.sock.write(tcpLine);
+  if (udpSessions.size) {
+    const pkt = Buffer.from(JSON.stringify({ type: "ping", t }));
+    for (const [, us] of udpSessions) {
+      try { udpServer.send(pkt, us.port, us.ip); } catch {}
+    }
+  }
 }, 5000);
 
 setInterval(() => {
@@ -790,6 +966,10 @@ async function enterSaving(line, station_id) {
     sessions.delete(key);                      // hapus sesi SEBELUM destroy, supaya "close" tidak memanggil judge()
     s.sock._why = "saving-mode";
     s.sock.destroy();
+  }
+  if (udpSessions.has(key)) {          // ← TAMBAH
+    udpSessions.delete(key);
+    udpSeen.delete(key);
   }
   engine.markDirty(line, station_id);
   for (const stop of [...(liveStreams.get(key) || [])]) stop();
@@ -1297,6 +1477,13 @@ app.delete("/api/station/:line/:station", async (req, res) => {
       return res.status(404).json({ error: `Station L${line}-ST${sid} tidak ditemukan` });
     helloCache.clear();
     log(`STATION DELETE L${line} ST${sid}`);
+    const skey = keyOf(line, sid);
+    const t = sessions.get(skey);
+    if (t) { sessions.delete(skey); try { t.sock._why = "station-deleted"; t.sock.destroy(); } catch {} }
+    udpSessions.delete(skey);
+    udpSeen.delete(skey);
+    fdAddr.delete(skey);
+    savingKeys.delete(skey);
     await broadcastSummary(); res.json({ ok: true });
   }catch (err) {
     if (err.code === "23503")      // foreign_key_violation (sebelumnya 547)
