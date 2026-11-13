@@ -9,9 +9,9 @@ export const ANOMALY_STYLE = {
   SHORT: { label: "SHORT", color: "var(--ct-anom-short)" },
 };
 export const TYPE_UI = {
-  OK: { palette: "green", label: "OK", bg: "white", hover: "gray.50", text: "gray.800", bar: null },
-  LONG: { palette: "red", label: "Over target", bg: "red.50", hover: "red.100", text: "red.700", bar: "red" },
-  SHORT: { palette: "orange", label: "Short", bg: "orange.50", hover: "orange.100", text: "orange.700", bar: "orange" },
+  OK: { palette: "green", label: "OK", bg: "var(--ct-surface)", hover: "var(--ct-ink-50)", text: "var(--ct-black)", bar: null },
+  LONG: { palette: "red", label: "Over target", bg: "rgba(var(--ct-red-rgb),.08)", hover: "rgba(var(--ct-red-rgb),.14)", text: "var(--ct-red-text)", bar: "var(--ct-red)" },
+  SHORT: { palette: "orange", label: "Short", bg: "rgba(var(--ct-orange-rgb),.08)", hover: "rgba(var(--ct-orange-rgb),.14)", text: "var(--ct-orange-text)", bar: "var(--ct-orange)" },
 };
 export function getAnomalyType(row) {
   if (!row) return "OK";
@@ -26,7 +26,7 @@ export function getAnomalyType(row) {
 export const EXPECTED_STYLE = { label: "Skipped", color: "var(--ct-anom-skip)" };
 export const EXPECTED_UI = {
   palette: "yellow", label: "Skipped",
-  bg: "yellow.50", hover: "yellow.100", text: "yellow.800", bar: "yellow",
+  bg: "rgba(var(--ct-yellow-rgb),.08)", hover: "rgba(var(--ct-yellow-rgb),.14)", text: "var(--ct-yellow)", bar: "var(--ct-yellow)",
 };
 
 export function expectedList(row) {
@@ -53,7 +53,14 @@ const HB_FLUSH_MS = 500;
 const CLOSE_DELAY_MS = 1000;    // jeda sebelum socket ditutup (menahan mount ulang React StrictMode / pindah halaman)
 const EMPTY = [];
 
-let state = { summary: EMPTY, heartbeats: {}, fdOnline: {}, connected: false, socket: null };
+let state = {
+  summary: EMPTY,
+  heartbeats: {},
+  fdOnline: {},
+  fdStatus: {},                 // "line-station" -> { online, saving, state, transport, rtt }
+  connected: false,
+  socket: null,
+};
 const listeners = new Set();
 let socket = null;
 let users = 0;
@@ -79,7 +86,7 @@ function sameRows(a, b) {
   }
   return true;
 }
-// buang heartbeat/fdOnline milik line di luar daftar langganan
+// buang heartbeat/fdOnline/fdStatus milik line di luar daftar langganan
 function pruneToLines(lines) {
   const keep = new Set(lines.map(String));
   const pick = (obj) => {
@@ -93,7 +100,12 @@ function pruneToLines(lines) {
   };
   const heartbeats = pick(state.heartbeats);
   const fdOnline = pick(state.fdOnline);
-  if (heartbeats !== state.heartbeats || fdOnline !== state.fdOnline) patch({ heartbeats, fdOnline });
+  const fdStatus = pick(state.fdStatus);
+  if (heartbeats !== state.heartbeats
+      || fdOnline !== state.fdOnline
+      || fdStatus !== state.fdStatus) {
+    patch({ heartbeats, fdOnline, fdStatus });
+  }
   for (const k in hbBuffer) if (!keep.has(k.split("-")[0])) delete hbBuffer[k];
 }
 // kirim daftar line yang dipantau ke server (gabungan semua pemakai); kosong = semua line
@@ -146,18 +158,49 @@ function connect() {
     }
   });
 
-  socket.on("fd_status", ({ line, station_id, online }) => {
+  socket.on("fd_status", ({ line, station_id, online, saving, transport, state: st, rtt }) => {
     if (DEBUG && !online)
       console.warn(`[DBG] fd_status online=false L${line} ST${station_id}`, new Date().toISOString());
     const k = `${line}-${station_id}`;
-    if (state.fdOnline[k] === online) return;
-    patch({ fdOnline: { ...state.fdOnline, [k]: online } });
+    const prev = state.fdStatus[k] || {};
+
+    // payload parsial: field yang tidak dikirim server mempertahankan nilai lama
+    const next = { ...prev, online };
+    if (saving !== undefined) next.saving = saving;
+    if (transport !== undefined) next.transport = transport;
+    if (st !== undefined) next.state = st;
+    if (rtt !== undefined) next.rtt = rtt;
+
+    const onlineChanged = state.fdOnline[k] !== online;
+    const statusChanged =
+      prev.online !== next.online ||
+      prev.saving !== next.saving ||
+      prev.transport !== next.transport ||
+      prev.state !== next.state ||
+      prev.rtt !== next.rtt;
+    if (!onlineChanged && !statusChanged) return;
+
+    const obj = {};
+    if (onlineChanged) obj.fdOnline = { ...state.fdOnline, [k]: online };
+    if (statusChanged) obj.fdStatus = { ...state.fdStatus, [k]: next };
+    patch(obj);
   });
 
   socket.on("fd_status_all", (rows) => {
     const m = {};
-    rows.forEach((r) => { m[`${r.line}-${r.station_id}`] = r.online; });
-    patch({ fdOnline: m });
+    const sm = {};
+    rows.forEach((r) => {
+      const k = `${r.line}-${r.station_id}`;
+      m[k] = r.online;
+      sm[k] = {
+        online: r.online,
+        saving: r.saving,
+        state: r.state,
+        transport: r.transport,
+        rtt: r.rtt,
+      };
+    });
+    patch({ fdOnline: m, fdStatus: sm });
   });
 
   flushTimer = setInterval(() => {
@@ -172,7 +215,14 @@ function disconnect() {
   if (socket) { socket.removeAllListeners(); socket.disconnect(); socket = null; }
   hbBuffer = {};
   sentKey = "all";
-  patch({ socket: null, connected: false, summary: EMPTY, heartbeats: {}, fdOnline: {} });
+  patch({
+    socket: null,
+    connected: false,
+    summary: EMPTY,
+    heartbeats: {},
+    fdOnline: {},
+    fdStatus: {},
+  });
 }
 // buang undefined/null/"" supaya tidak terkirim sebagai "undefined"/"null"; 0 dan false tetap dikirim
 function buildParams(obj = {}) {
@@ -212,6 +262,7 @@ export const isAbort = (e) => axios.isCancel(e) || e?.name === "CanceledError";
 export const selectSummary = (s) => s.summary;
 export const selectHeartbeats = (s) => s.heartbeats;
 export const selectFdOnline = (s) => s.fdOnline;
+export const selectFdStatus = (s) => s.fdStatus;
 export const selectConnected = (s) => s.connected;
 export const selectSocket = (s) => s.socket;
 
@@ -268,6 +319,7 @@ export function useSocket({ lines } = {}) {
     recentCycles: EMPTY,
     connected: s.connected,
     fdOnline: s.fdOnline,
+    fdStatus: s.fdStatus,
     fetchHistory,
     fetchHourly,
     fetchStats,
