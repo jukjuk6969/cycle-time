@@ -2,6 +2,9 @@
  * StationDetail.jsx
  * Single station detail panel: settings (takt, ROI timeout), filters,
  * stats summary, cycle-time chart, and cycle history.
+ *
+ * Network strip menampilkan status koneksi FD: ONLINE/OFFLINE/SAVING,
+ * transport (TCP/UDP), RTT, endpoint (IP:port), hostname, dan last_seen.
  */
 
 import React, { useEffect, useState, useCallback, useRef } from "react";
@@ -11,7 +14,10 @@ import {
   Box, Flex, Grid, Text, Button, Input, SimpleGrid, HStack, Badge,
   Table, Spinner, NativeSelect,
 } from "@chakra-ui/react";
-import { ANOMALY_STYLE, getAnomalyType, expectedList, getRowUi, isAbort } from "../hooks/useSocket";
+import {
+  ANOMALY_STYLE, getAnomalyType, expectedList, getRowUi, isAbort,
+  useSocketState, selectFdStatus,
+} from "../hooks/useSocket";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer,
 } from "recharts";
@@ -32,17 +38,17 @@ const SANS = `"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif
 
 // Astra Visteon palette
 const C = {
-  brand: "#005A9C",
-  anomaly: "#DC2626",
-  grid: "#E2E8F0",
-  takt: "#94A3B8",
-  axis: "#64748B",
-  skipped: "#F58025",
-  ink: "#0F172A",
-  muted: "#64748B",
-  faint: "#94A3B8",
-  surface: "#FAFBFC",
-  rule: "#E2E8F0",
+  brand: "var(--ct-blue)",
+  anomaly: "var(--ct-red)",
+  grid: "var(--ct-ink-200)",
+  takt: "var(--ct-ink-400)",
+  axis: "var(--ct-ink-500)",
+  skipped: "var(--ct-orange-strong)",
+  ink: "var(--ct-black)",
+  muted: "var(--ct-ink-500)",
+  faint: "var(--ct-ink-400)",
+  surface: "var(--ct-ink-50)",
+  rule: "var(--ct-ink-200)",
 };
 
 const num = { fontVariantNumeric: "tabular-nums", fontFamily: MONO };
@@ -93,6 +99,33 @@ function tsToTime(ts) {
     return "—";
   }
 }
+
+/* ---- Network helpers ----------------------------------------------- */
+
+function lastSeenText(ls) {
+  if (!ls) return "—";
+  const d = ls instanceof Date ? ls : new Date(ls);
+  if (Number.isNaN(d.getTime())) return "—";
+  const diff = Date.now() - d.getTime();
+  if (diff < 0) return "—";
+  if (diff < 60_000) return "just now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return d.toLocaleString("en-GB", {
+    timeZone: "Asia/Jakarta",
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+const TRANSPORT_META = {
+  tcp:    { label: "TCP",    palette: "blue"   },
+  udp:    { label: "UDP",    palette: "purple" },
+  saving: { label: "SAVING", palette: "orange" },
+};
 
 /* =========================================================
    HOOK: inline numeric edit (Takt, ROI timeout, Min CT, Short limit)
@@ -446,6 +479,26 @@ function EmptyNote({ children }) {
   );
 }
 
+/* Network strip: satu pasangan label+nilai, hairline-row di dalam Flex */
+function NetItem({ label, children }) {
+  return (
+    <HStack gap={SP.sm} align="center" minW="0">
+      <Text
+        fontSize="9px"
+        fontWeight="700"
+        color={C.muted}
+        fontFamily={MONO}
+        textTransform="uppercase"
+        letterSpacing="0.08em"
+        whiteSpace="nowrap"
+      >
+        {label}
+      </Text>
+      {children}
+    </HStack>
+  );
+}
+
 /* =========================================================
    MAIN COMPONENT
    ========================================================= */
@@ -465,6 +518,12 @@ export default function StationDetail({
   const line = station?.line;
   const stationId = station?.station_id;
   const stationKey = `${line}-${stationId}`;
+
+  // ── Network / connection info dari Socket.IO ──
+  // fdStatusMap: { "line-station": { online, saving, state, transport, rtt } }
+  // Hanya station ini yang di-subscribe agar tidak re-render saat line lain berubah.
+  const fdStatusMap = useSocketState(selectFdStatus, line != null ? { lines: [line] } : {});
+  const netInfo = fdStatusMap[stationKey] || {};
 
   const lastSeenRef = useRef(null);
   const historyRef = useRef([]);
@@ -582,36 +641,36 @@ export default function StationDetail({
   useEffect(() => { setRoiLocal(null); }, [station?.roi_timeout_sec]);
 
   /* ---------- load data ---------- */
-const loadAll = useCallback(
-  async (flt) => {
-    if (stationId == null) return;
-    const id = ++reqId.current;
+  const loadAll = useCallback(
+    async (flt) => {
+      if (stationId == null) return;
+      const id = ++reqId.current;
 
-    acRef.current?.abort();                 // batalkan request sebelumnya
-    const ac = new AbortController();
-    acRef.current = ac;
+      acRef.current?.abort();                 // batalkan request sebelumnya
+      const ac = new AbortController();
+      acRef.current = ac;
 
-    setLoading(true);
-    try {
-      const q = toApiRange(flt);
-      const [hist, st] = await Promise.all([
-        fetchHistory(line, stationId, 100, q, { signal: ac.signal }),
-        fetchStats(line, stationId, q, { signal: ac.signal }),
-      ]);
-      if (id !== reqId.current) return;
-      setHistory(hist.slice(-100));
-      setStats(st);
-    } catch (e) {
-      if (isAbort(e) || id !== reqId.current) return;
-      console.error("Failed to load station data:", e);
-      setHistory([]);
-      setStats(null);
-    } finally {
-      if (id === reqId.current) setLoading(false);
-    }
-  },
-  [line, stationId, fetchHistory, fetchStats]
-);
+      setLoading(true);
+      try {
+        const q = toApiRange(flt);
+        const [hist, st] = await Promise.all([
+          fetchHistory(line, stationId, 100, q, { signal: ac.signal }),
+          fetchStats(line, stationId, q, { signal: ac.signal }),
+        ]);
+        if (id !== reqId.current) return;
+        setHistory(hist.slice(-100));
+        setStats(st);
+      } catch (e) {
+        if (isAbort(e) || id !== reqId.current) return;
+        console.error("Failed to load station data:", e);
+        setHistory([]);
+        setStats(null);
+      } finally {
+        if (id === reqId.current) setLoading(false);
+      }
+    },
+    [line, stationId, fetchHistory, fetchStats]
+  );
 
   useEffect(() => {
     loadAll(filters);
@@ -654,6 +713,8 @@ const loadAll = useCallback(
         anomaly_type: aType,
         operator_id: latest.operator_id,
         skipped_expected: skipped,
+        target_limit_sec: latest.target_limit_sec ?? null,
+        short_limit_sec: latest.short_limit_sec ?? null,
       },
     ]);
 
@@ -685,11 +746,18 @@ const loadAll = useCallback(
     time: tsToTime(h.end_timestamp),
     type: getAnomalyType(h),
     anomaly: h.is_anomaly ? Number(h.cycle_time_sec?.toFixed(2)) : null,
+    // snapshot saat cycle terjadi; baris tanpa snapshot jatuh ke limit station sekarang
+    target: Number(h.target_limit_sec) > 0
+      ? Number(h.target_limit_sec)
+      : (targetCT != null ? Number(targetCT) : null),
+    short: Number(h.target_limit_sec) > 0
+      ? (Number(h.short_limit_sec) > 0 ? Number(h.short_limit_sec) : null)
+      : (Number(shortLimit) > 0 ? Number(shortLimit) : null),
   }));
 
   const rows = [...history].reverse();
 
-  const refs = [takt, targetCT, Number(shortLimit) > 0 ? shortLimit : null]
+  const refs = [takt, ...chartData.flatMap((d) => [d.target, d.short])]
     .filter((n) => n != null && Number.isFinite(Number(n)))
     .map(Number);
   const yDomain = [
@@ -713,7 +781,7 @@ const loadAll = useCallback(
     { label: "Std deviation", value: stats.stddev_ct != null ? `${Number(stats.stddev_ct).toFixed(2)}s` : "—" },
     { label: "Over target", value: longCount, color: longCount > 0 ? C.anomaly : C.ink },
     { label: "Short", value: shortCount, color: shortCount > 0 ? C.skipped : C.ink },
-    { label: "Skipped", value: skippedCount, color: skippedCount > 0 ? "#CA8A04" : C.ink },
+    { label: "Skipped", value: skippedCount, color: skippedCount > 0 ? "var(--ct-yellow)" : C.ink },
     { label: "Efficiency", value: eff != null ? `${eff}%` : "—", color: effColor, sub: "cycles in target" },
   ] : [];
 
@@ -744,9 +812,30 @@ const loadAll = useCallback(
     { key: "short", el: <InlineSetting label="Short limit" valueText={Number(shortLimit) > 0 ? fmt(shortLimit) : "Disabled"} edit={shortEdit} /> },
   ];
 
+  /* ---------- network strip values ---------- */
+  const isOnline = netInfo.online ?? station?.is_online ?? false;
+  const isSaving = netInfo.saving ?? savingMode;
+  const transport = isSaving
+    ? "saving"
+    : (netInfo.transport || (isOnline ? "tcp" : null));
+  const transportMeta = transport ? TRANSPORT_META[transport] : null;
+  const connState = netInfo.state
+    || (isSaving ? "SAVING_MODE" : isOnline ? "ONLINE" : "OFFLINE");
+  const rtt = netInfo.rtt;
+  const ip = station?.ip;
+  const port = station?.port;
+  const hostname = station?.hostname;
+  const lastSeen = station?.last_seen;
+
+  const dotColor = isSaving
+    ? "var(--ct-orange)"
+    : isOnline
+      ? "var(--ct-green)"
+      : "var(--ct-red)";
+
   return (
     <Box
-      bg="#FFFFFF"
+      bg="var(--ct-surface)"
       borderWidth="1px"
       borderColor={C.rule}
       borderTopWidth="2px"
@@ -777,6 +866,85 @@ const loadAll = useCallback(
             Download CSV
           </Button>
         </Flex>
+
+        {/* ---- NETWORK / CONNECTION ---- */}
+        <Box
+          mt={SP.md}
+          px={SP.lg}
+          py={SP.sm}
+          borderWidth="1px"
+          {...rule}
+          borderRadius="4px"
+          bg="var(--ct-canvas)"
+        >
+          <Flex gap={SP.lg} wrap="wrap" align="center" rowGap={SP.sm}>
+            <NetItem label="Status">
+              <Flex align="center" gap={SP.sm}>
+                <Box
+                  w="7px" h="7px" borderRadius="full"
+                  bg={dotColor}
+                  boxShadow={isOnline ? `0 0 0 3px rgba(76,175,80,0.18)` : "none"}
+                />
+                <Text fontSize="11px" fontWeight="700" color={C.ink} fontFamily={MONO}>
+                  {connState}
+                </Text>
+              </Flex>
+            </NetItem>
+
+            <NetItem label="Transport">
+              {transportMeta ? (
+                <Badge
+                  colorPalette={transportMeta.palette}
+                  variant="subtle"
+                  fontSize="10px" fontWeight="700" fontFamily={MONO}
+                  letterSpacing="0.05em" h="18px" px={SP.md}
+                  borderRadius="2px"
+                >
+                  {transportMeta.label}
+                </Badge>
+              ) : (
+                <Text fontSize="11px" color={C.faint} fontFamily={MONO}>—</Text>
+              )}
+            </NetItem>
+
+            {rtt != null && (
+              <NetItem label="RTT">
+                <Text fontSize="11px" fontWeight="600" color={C.ink} style={num}>
+                  {rtt} ms
+                </Text>
+              </NetItem>
+            )}
+
+            {(ip || port) && (
+              <NetItem label="Endpoint">
+                <Text fontSize="11px" color={C.ink} style={num}>
+                  {ip || "—"}{port ? `:${port}` : ""}
+                </Text>
+              </NetItem>
+            )}
+
+            {hostname && (
+              <NetItem label="Hostname">
+                <Text
+                  fontSize="11px" color={C.ink} fontFamily={MONO}
+                  maxW="189px" overflow="hidden"
+                  textOverflow="ellipsis" whiteSpace="nowrap"
+                  title={hostname}
+                >
+                  {hostname}
+                </Text>
+              </NetItem>
+            )}
+
+            {lastSeen && (
+              <NetItem label="Last seen">
+                <Text fontSize="11px" color={C.muted} style={num}>
+                  {lastSeenText(lastSeen)}
+                </Text>
+              </NetItem>
+            )}
+          </Flex>
+        </Box>
 
         {/* ---- SETTINGS STRIP ---- */}
         <Box mt={SP.lg} borderWidth="1px" {...rule} borderRadius="6px" bg={C.surface} overflow="hidden">
@@ -810,7 +978,7 @@ const loadAll = useCallback(
       {/* ===================================================
           FILTER TOOLBAR
           =================================================== */}
-      <Box px={SP.xl} py={SP.md} bg="#F4F6F8" borderTopWidth="1px" borderBottomWidth="1px" {...rule}>
+      <Box px={SP.xl} py={SP.md} bg="var(--ct-canvas)" borderTopWidth="1px" borderBottomWidth="1px" {...rule}>
         <FilterBar filters={filters} onChange={handleFilter} />
       </Box>
 
@@ -863,34 +1031,28 @@ const loadAll = useCallback(
                           allowDecimals={false}
                         />
                         <Tooltip
-                          contentStyle={{ fontSize: 11, fontFamily: MONO, borderRadius: 4, border: `1px solid ${C.rule}`, boxShadow: "0 4px 12px rgba(0,0,0,0.08)", background: "#FFFFFF" }}
-                          formatter={(v) => [`${v}s`, "CT"]}
+                          contentStyle={{ fontSize: 11, fontFamily: MONO, borderRadius: 4, border: `1px solid ${C.rule}`, boxShadow: "var(--ct-shadow-md)", background: "var(--ct-surface)", color: "var(--ct-black)" }}
+                          formatter={(v, name) => [`${v}s`, name]}
                           labelFormatter={(i) => `Cycle #${i}, ${chartData[i - 1]?.time || ""}`}
                         />
-                        {takt && (
+                        {takt && !sameTarget && (
                           <ReferenceLine
                             y={Number(takt)}
                             stroke={C.takt}
                             strokeDasharray="4 2"
-                            label={{ value: sameTarget ? "Takt = Target" : "Takt", position: "insideBottomRight", fontSize: 10, fill: C.takt, fontFamily: MONO }}
+                            label={{ value: "Takt", position: "insideBottomRight", fontSize: 10, fill: C.takt, fontFamily: MONO }}
                           />
                         )}
-                        {targetCT && !sameTarget && (
-                          <ReferenceLine
-                            y={Number(targetCT)}
-                            stroke={C.anomaly}
-                            strokeDasharray="4 2"
-                            label={{ value: "Target", position: "insideTopRight", fontSize: 10, fill: C.anomaly, fontFamily: MONO }}
-                          />
-                        )}
-                        {Number(shortLimit) > 0 && (
-                          <ReferenceLine
-                            y={Number(shortLimit)}
-                            stroke={ANOMALY_STYLE.SHORT.color}
-                            strokeDasharray="4 2"
-                            label={{ value: "Short", position: "insideBottomLeft", fontSize: 10, fill: ANOMALY_STYLE.SHORT.color, fontFamily: MONO }}
-                          />
-                        )}
+                        <Line
+                          type="stepAfter" dataKey="target" name="Target"
+                          stroke={C.anomaly} strokeWidth={1} strokeDasharray="4 2"
+                          dot={false} activeDot={false} isAnimationActive={false}
+                        />
+                        <Line
+                          type="stepAfter" dataKey="short" name="Short"
+                          stroke={ANOMALY_STYLE.SHORT.color} strokeWidth={1} strokeDasharray="4 2"
+                          dot={false} activeDot={false} isAnimationActive={false}
+                        />
                         <Line
                           type="monotone"
                           dataKey="ct"
@@ -924,7 +1086,7 @@ const loadAll = useCallback(
                   ) : (
                     <Table.Root size="sm" stickyHeader interactive>
                       <Table.Header>
-                        <Table.Row bg="#F8FAFC" h={ROW_H}>
+                        <Table.Row bg="var(--ct-ink-50)" h={ROW_H}>
                           {[
                             { h: "#", align: "end" },
                             { h: "Time" },
@@ -935,8 +1097,8 @@ const loadAll = useCallback(
                             <Table.ColumnHeader
                               key={c.h}
                               textAlign={c.align}
-                              bg="#F8FAFC"
-                              color="#475569"
+                              bg="var(--ct-ink-50)"
+                              color="var(--ct-ink-600)"
                               fontWeight="700"
                               fontSize="10px"
                               fontFamily={MONO}
@@ -945,7 +1107,7 @@ const loadAll = useCallback(
                               px={SP.lg}
                               py={0}
                               whiteSpace="nowrap"
-                              borderBottom="1px solid #E2E8F0"
+                              borderBottom="1px solid var(--ct-ink-200)"
                             >
                               {c.h}
                             </Table.ColumnHeader>
@@ -967,13 +1129,13 @@ const loadAll = useCallback(
                               h={ROW_H}
                               bg={ui.bg}
                               _hover={{ bg: ui.hover }}
-                              boxShadow={ui.bar ? `inset 3px 0 0 var(--chakra-colors-${ui.bar}-500)` : "none"}
+                              boxShadow={ui.bar ? `inset 3px 0 0 ${ui.bar}` : "none"}
                             >
                               <Table.Cell {...cell} textAlign="end" color={C.faint} style={num}>
                                 {history.length - i}
                               </Table.Cell>
 
-                              <Table.Cell {...cell} color="#475569" style={num}>
+                              <Table.Cell {...cell} color="var(--ct-ink-600)" style={num}>
                                 {tsToTime(row.end_timestamp)}
                               </Table.Cell>
 
